@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +95,8 @@ func handleSession(profile string, args []string) {
 		handleSessionChildren(profile, args[1:])
 	case "search":
 		handleSessionSearch(profile, args[1:])
+	case "select":
+		handleSessionSelect(profile, args[1:])
 	case "help", "--help", "-h":
 		printSessionHelp()
 	default:
@@ -131,6 +135,7 @@ func printSessionHelp() {
 	fmt.Println("  output <id>             Get the last response from a session")
 	fmt.Println("  children [id]           List sub-sessions with status + last completion")
 	fmt.Println("  search <query>          Search message content across Claude sessions")
+	fmt.Println("  select <id|title>       Tell running TUI to switch to a session (via IPC)")
 	fmt.Println("  set-parent <id> <parent>  Link session as sub-session of parent")
 	fmt.Println("  unset-parent <id>       Remove sub-session link")
 	fmt.Println("  update <id> --no-parent          Alias for unset-parent <id>")
@@ -649,6 +654,7 @@ func handleSessionRestart(profile string, args []string) {
 	all := fs.Bool("all", false, "Restart all active sessions")
 	envFlags := make(envVarFlags)
 	fs.Var(&envFlags, "env", "Environment variable in KEY=VALUE format for the restarted process (can be repeated)")
+	except := fs.String("except", "", "Comma-separated list of session IDs or titles to skip (use with --all)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session restart [id|title] [options]")
@@ -677,6 +683,7 @@ func handleSessionRestart(profile string, args []string) {
 		fmt.Println("  agent-deck session restart my-project --env API_URL=https://api.example.com")
 		fmt.Println("  agent-deck session restart my-project --env FOO=one --env BAR=two")
 		fmt.Println("  agent-deck session restart --all")
+		fmt.Println("  agent-deck session restart --all --except launcher,home")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -694,7 +701,14 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	if *all {
-		restartAllSessions(out, storage, instances, groups, envFlags)
+		var exceptSet map[string]bool
+		if *except != "" {
+			exceptSet = make(map[string]bool)
+			for _, e := range strings.Split(*except, ",") {
+				exceptSet[strings.TrimSpace(e)] = true
+			}
+		}
+		restartAllSessions(out, storage, instances, groups, exceptSet, envFlags)
 		return
 	}
 
@@ -778,12 +792,21 @@ func handleSessionRestart(profile string, args []string) {
 // already held for auth, staggers boots with jitter, caps how many unverified
 // boots contend for the token at once, and stops entirely after a few
 // consecutive auth-deaths with one loud message instead of burning the fleet.
-func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData, env map[string]string) {
+//
+// exceptSet, if non-nil, skips sessions whose ID or Title matches a key.
+func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData, exceptSet map[string]bool, env map[string]string) {
 	var active []*session.Instance
 	for _, inst := range instances {
-		if inst.Exists() {
-			active = append(active, inst)
+		if !inst.Exists() {
+			continue
 		}
+		if exceptSet != nil && (exceptSet[inst.ID] || exceptSet[inst.Title]) {
+			if !out.jsonMode && !out.quietMode {
+				fmt.Printf("Skipping %s (excluded)\n", inst.Title)
+			}
+			continue
+		}
+		active = append(active, inst)
 	}
 
 	if len(active) == 0 {
@@ -854,6 +877,11 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 		fmt.Fprintf(os.Stderr, "\n🔒 %s\n", sweepResult.TripMessage)
 	}
 
+	// Sync Claude app display names: for each Claude session, check if the
+	// name in the session metadata matches the agent-deck title. If not,
+	// send /rename to set it.
+	syncClaudeDisplayNames(out, active)
+
 	if out.jsonMode {
 		out.Success("", restartAllSessionsJSONPayload(len(active), sweepResult, ordered))
 	} else if !out.quietMode {
@@ -890,6 +918,60 @@ func branchCleanupHint(createdBranch bool, repoRoot, branchName string) string {
 		return ""
 	}
 	return fmt.Sprintf(" && git -C %s branch -D %s", shellescape.Quote(repoRoot), shellescape.Quote(branchName))
+}
+
+// syncClaudeDisplayNames sends /rename to Claude sessions whose display
+// name doesn't match the agent-deck title.
+func syncClaudeDisplayNames(out *CLIOutput, instances []*session.Instance) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	claudeDir := filepath.Join(home, ".claude")
+
+	var claudeInstances []*session.Instance
+	for _, inst := range instances {
+		if session.IsClaudeCompatible(inst.Tool) {
+			claudeInstances = append(claudeInstances, inst)
+		}
+	}
+	if len(claudeInstances) == 0 {
+		return
+	}
+
+	// Wait for session metadata files to be written by new Claude processes
+	time.Sleep(3 * time.Second)
+
+	renamed := 0
+	for _, inst := range claudeInstances {
+		if inst.ClaudeSessionID == "" {
+			continue
+		}
+		currentName := findClaudeSessionName(claudeDir, inst.ClaudeSessionID)
+		if currentName == inst.Title {
+			continue
+		}
+
+		tmuxSess := inst.GetTmuxSession()
+		if tmuxSess == nil || !tmuxSess.Exists() {
+			continue
+		}
+
+		if err := sendNoWait(tmuxSess, inst.Tool, "/rename "+inst.Title); err != nil {
+			if !out.jsonMode && !out.quietMode {
+				fmt.Fprintf(os.Stderr, "  Failed to rename %s: %v\n", inst.Title, err)
+			}
+			continue
+		}
+		renamed++
+		if !out.jsonMode && !out.quietMode {
+			fmt.Printf("  Renamed: %s\n", inst.Title)
+		}
+	}
+
+	if renamed > 0 && !out.jsonMode && !out.quietMode {
+		fmt.Printf("Set display name for %d sessions\n", renamed)
+	}
 }
 
 // handleSessionFork forks a supported tool session
@@ -4917,5 +4999,71 @@ func handleSessionSearch(profile string, args []string) {
 		if h.Snippet != "" {
 			fmt.Printf("   %s\n", h.Snippet)
 		}
+	}
+}
+
+// handleSessionSelect sends a "select" command to a running TUI via the IPC
+// Unix socket. The TUI will detach from any current session and switch to the
+// specified session.
+func handleSessionSelect(profile string, args []string) {
+	fs := flag.NewFlagSet("session select", flag.ExitOnError)
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session select <id|title>")
+		fmt.Println()
+		fmt.Println("Tell a running agent-deck TUI to switch to the specified session.")
+		fmt.Println("If the TUI is currently attached to another session, it will")
+		fmt.Println("detach first, then attach to the target session.")
+		fmt.Println()
+		fmt.Println("This command communicates with the running TUI via a Unix socket.")
+		fmt.Println("If no TUI is running, the command will fail.")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck session select my-project")
+		fmt.Println("  agent-deck session select abc123")
+		fmt.Println("  agent-deck -p work session select my-project")
+	}
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	identifier := fs.Arg(0)
+	if identifier == "" {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	effectiveProfile := session.GetEffectiveProfile(profile)
+	socketPath := ui.IPCSocketPath(effectiveProfile)
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot connect to running TUI (socket %s): %v\n", socketPath, err)
+		fmt.Fprintln(os.Stderr, "Is agent-deck running?")
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	// Send the select command
+	_, err = fmt.Fprintf(conn, "select %s\n", identifier)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to send command: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Read response
+	scanner := bufio.NewScanner(conn)
+	if scanner.Scan() {
+		resp := scanner.Text()
+		if resp == "ok" {
+			fmt.Printf("Sent select command for: %s\n", identifier)
+		} else {
+			fmt.Fprintf(os.Stderr, "Error from TUI: %s\n", resp)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Error: no response from TUI")
+		os.Exit(1)
 	}
 }

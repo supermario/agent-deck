@@ -968,6 +968,16 @@ func main() {
 		p.Send(ui.MaintenanceCompleteMsg{Result: result})
 	})
 
+	// Start IPC server for external commands (e.g., session select).
+	ipcProfile := session.GetEffectiveProfile(profile)
+	ipcServer := ui.NewIPCServer(ipcProfile, p, homeModel)
+	if err := ipcServer.Start(); err != nil {
+		// Non-fatal: IPC is a convenience feature; TUI works without it.
+		logging.ForComponent(logging.CompUI).Warn("ipc_server_start_failed",
+			slog.String("error", err.Error()))
+	}
+	defer ipcServer.Stop()
+
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)

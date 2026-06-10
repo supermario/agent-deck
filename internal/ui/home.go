@@ -494,6 +494,11 @@ type Home struct {
 	isNavigating       bool      // True if user is rapidly navigating
 	lastAttachReturn   time.Time // When we returned from tea.Exec attach/detach
 	navigationHotUntil atomic.Int64
+
+	// IPC: tracks the tmux session currently attached via tea.Exec so that
+	// the IPC server can force-detach it when a "session select" arrives.
+	attachedTmuxName   atomic.Value // string: tmux session name (empty when not attached)
+	attachedTmuxSocket atomic.Value // string: tmux socket name (empty = default)
 	// Snapshot of status/tool used by render path to avoid per-row lock contention.
 	sessionRenderSnapshot atomic.Value // map[string]sessionRenderState
 
@@ -854,6 +859,26 @@ func (h *Home) attachOptions(sess *tmux.Session) tmux.AttachOptions {
 		opts.ScrollbackGate = func() bool { return openScrollbackOnPageUp(sess.IsAltScreen()) }
 	}
 	return opts
+}
+
+// getAttachedTmuxName returns the tmux session name currently attached via
+// tea.Exec, or "" if not attached. Thread-safe (atomic.Value).
+func (h *Home) getAttachedTmuxName() string {
+	v := h.attachedTmuxName.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+// getAttachedTmuxSocket returns the tmux socket name of the currently-attached
+// session, or "" for the default server. Thread-safe (atomic.Value).
+func (h *Home) getAttachedTmuxSocket() string {
+	v := h.attachedTmuxSocket.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
 }
 
 func (h *Home) setHotkeys(bindings map[string]string) {
@@ -6695,6 +6720,57 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// snapshot it just published. Pure in-memory work, no tmux, no disk.
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
+		return h, nil
+
+	case IPCSelectMsg:
+		// External IPC request to select and attach a session by ID or title.
+		// If the TUI just returned from an attach (force-detach via IPC), the
+		// statusUpdateMsg has already been processed. Find the target session,
+		// position cursor, and attach.
+		target := strings.ToLower(strings.TrimSpace(msg.Target))
+		for i, item := range h.flatItems {
+			if item.Type != session.ItemTypeSession || item.Session == nil {
+				continue
+			}
+			if item.Session.ID == msg.Target ||
+				strings.EqualFold(item.Session.Title, msg.Target) ||
+				strings.ToLower(item.Session.Title) == target {
+				h.cursor = i
+				h.syncViewport()
+				// Only attach if the session is running
+				if item.Session.Exists() {
+					return h, h.attachSession(item.Session)
+				}
+				return h, nil
+			}
+		}
+		// Session might be in a collapsed group; search instanceByID and expand.
+		h.instancesMu.RLock()
+		var matchedInst *session.Instance
+		for _, inst := range h.instances {
+			if inst.ID == msg.Target ||
+				strings.EqualFold(inst.Title, msg.Target) ||
+				strings.ToLower(inst.Title) == target {
+				matchedInst = inst
+				break
+			}
+		}
+		h.instancesMu.RUnlock()
+		if matchedInst != nil && matchedInst.GroupPath != "" && h.groupTree != nil {
+			h.groupTree.ExpandGroupWithParents(matchedInst.GroupPath)
+			h.rebuildFlatItems()
+			for i, item := range h.flatItems {
+				if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == matchedInst.ID {
+					h.cursor = i
+					h.syncViewport()
+					if item.Session.Exists() {
+						return h, h.attachSession(item.Session)
+					}
+					return h, nil
+				}
+			}
+		}
+		uiLog.Warn("ipc_select_target_not_found", slog.String("target", msg.Target))
 		return h, nil
 
 	case previewDebounceMsg:
@@ -13748,6 +13824,10 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
 	h.isAttaching.Store(true) // Prevent View() output only during actual attach transition
+	// IPC: record the tmux session we are about to attach so that
+	// forceDetachCurrent() can issue `tmux detach-client -s <name>`.
+	h.attachedTmuxName.Store(tmuxSess.Name)
+	h.attachedTmuxSocket.Store(tmuxSess.SocketName)
 	res := &attachResult{}
 	return tea.Exec(attachCmd{
 		session: tmuxSess,
@@ -13766,6 +13846,9 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 		// Belt for the path where Bubble Tea fails to release the terminal and
 		// invokes this callback without ever running attachCmd.Run().
 		h.isAttaching.Store(false) // Atomic store for thread safety
+		// IPC: clear attached session tracking
+		h.attachedTmuxName.Store("")
+		h.attachedTmuxSocket.Store("")
 
 		// NOTE: No manual screen clear here. Bubble Tea's RestoreTerminal()
 		// re-enters alt screen which handles clearing. Direct fmt.Print
