@@ -182,6 +182,8 @@ type Server struct {
 	// streams (see trackInFlight). It is what Idle reports for the
 	// headless self-restart.
 	inFlight atomic.Int64
+
+	overlay *overlayPusher
 }
 
 // NewServer creates a new web server with base routes and middleware.
@@ -213,6 +215,7 @@ func NewServer(cfg Config) *Server {
 		s.remoteFleet = session.NewRemoteFleetScanner()
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
+	s.overlay = newOverlayPusher(menuData)
 	webLog := logging.ForComponent(logging.CompWeb)
 	if pushSvc, err := newPushService(cfg, menuData); err != nil {
 		webLog.Warn("push_disabled", slog.String("error", err.Error()))
@@ -349,6 +352,9 @@ func (s *Server) Start() error {
 
 	if s.push != nil {
 		s.push.Start(s.baseCtx)
+	}
+	if s.overlay != nil {
+		s.overlay.startPeriodicPush(s.baseCtx, 5*time.Second)
 	}
 	err := s.httpServer.ListenAndServe()
 	if s.hookWatcher != nil {
@@ -509,6 +515,10 @@ func (s *Server) notifyMenuChanged() {
 		}
 	}
 	s.menuSubscribersMu.Unlock()
+
+	if s.overlay != nil {
+		s.overlay.triggerAsync(s.baseCtx)
+	}
 }
 
 // checkMutationsAllowed writes a 403 response and returns false when web mutations are disabled.
