@@ -175,6 +175,8 @@ type Server struct {
 	// whose hook file is present on disk. Defaults to defaultLoadHookStatuses
 	// (which reads ~/.agent-deck/hooks/) but is injectable for tests.
 	hookStatusLoader func() map[string]*session.HookStatus
+
+	overlay *overlayPusher
 }
 
 // NewServer creates a new web server with base routes and middleware.
@@ -206,6 +208,7 @@ func NewServer(cfg Config) *Server {
 		s.remoteFleet = session.NewRemoteFleetScanner()
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
+	s.overlay = newOverlayPusher(menuData)
 	webLog := logging.ForComponent(logging.CompWeb)
 	if pushSvc, err := newPushService(cfg, menuData); err != nil {
 		webLog.Warn("push_disabled", slog.String("error", err.Error()))
@@ -343,6 +346,9 @@ func (s *Server) Start() error {
 	if s.push != nil {
 		s.push.Start(s.baseCtx)
 	}
+	if s.overlay != nil {
+		s.overlay.startPeriodicPush(s.baseCtx, 5*time.Second)
+	}
 	err := s.httpServer.ListenAndServe()
 	if s.hookWatcher != nil {
 		s.hookWatcher.Stop()
@@ -464,6 +470,10 @@ func (s *Server) notifyMenuChanged() {
 	// sessions created via the API would never appear until server restart.
 	if mmd, ok := s.menuData.(*MemoryMenuData); ok {
 		mmd.InvalidateCache()
+	}
+
+	if s.overlay != nil {
+		s.overlay.triggerAsync(s.baseCtx)
 	}
 }
 

@@ -452,6 +452,10 @@ func main() {
 	// background so it never blocks TUI boot. See .planning/v178-ssh-reviver/PLAN.md.
 	go reviveOnStartup(profile)
 
+	overlayCtx, overlayCancel := context.WithCancel(context.Background())
+	defer overlayCancel()
+	web.StartOverlayPusher(overlayCtx, profile)
+
 	// Block TUI launch inside a managed session to prevent infinite nesting.
 	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
 	// In headless web mode (--no-tui), no TUI launches, so this guard is skipped.
