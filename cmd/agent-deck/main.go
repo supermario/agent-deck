@@ -452,9 +452,16 @@ func main() {
 	// background so it never blocks TUI boot. See .planning/v178-ssh-reviver/PLAN.md.
 	go reviveOnStartup(profile)
 
-	overlayCtx, overlayCancel := context.WithCancel(context.Background())
-	defer overlayCancel()
-	web.StartOverlayPusher(overlayCtx, profile)
+	// In web mode the web server starts its own overlay pusher (see
+	// server.go Start()). Only launch the standalone pusher in pure-TUI
+	// mode, otherwise two pushers run with independent idle-tracking state
+	// and fight over the session list — expired sessions flicker in and out
+	// every push cycle.
+	if !webEnabled {
+		overlayCtx, overlayCancel := context.WithCancel(context.Background())
+		defer overlayCancel()
+		web.StartOverlayPusher(overlayCtx, profile)
+	}
 
 	// Block TUI launch inside a managed session to prevent infinite nesting.
 	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
