@@ -23,6 +23,13 @@ import (
 func (s *Server) csrfProtect(next http.Handler) http.Handler {
 	failClosed := s.cfg.Token != ""
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The mobile API is called cross-origin from the phone app's file://
+		// origin over Tailscale; it does its own CORS and is exempt from the
+		// same-origin CSRF check. It's only reachable on the tailnet.
+		if strings.HasPrefix(r.URL.Path, "/api/mobile/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !isMutationMethod(r.Method) {
 			next.ServeHTTP(w, r)
 			return

@@ -244,6 +244,12 @@ func NewServer(cfg Config) *Server {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	})
+	// Mobile client API (BentoLife phone app over Tailscale). CORS-enabled and
+	// CSRF-exempt (see csrf.go); method dispatch happens inside each handler.
+	mux.HandleFunc("/api/mobile/sessions", s.handleMobileSessions)
+	mux.HandleFunc("/api/mobile/session/{id}/transcript", s.handleMobileTranscript)
+	mux.HandleFunc("/api/mobile/session/{id}/send", s.handleMobileSend)
+
 	mux.HandleFunc("/api/menu", s.handleMenu)
 	mux.HandleFunc("/api/session/", s.handleSessionByID)
 	mux.HandleFunc("/api/sessions", s.handleSessionsCollection)
