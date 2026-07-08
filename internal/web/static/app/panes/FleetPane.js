@@ -93,7 +93,7 @@ function GroupCard({ name, items, onSelect }) {
         <span class="cost"></span>
       </div>
       <div class="gc-tiles">
-        ${items.slice(0, 6).map(s => html`
+        ${items.map(s => html`
           <button key=${s.id} class="tile" data-testid="fleet-session-tile" data-session-id=${s.id} onClick=${() => onSelect(s.id)}>
             <span class=${`tdot ${s.status}`}/>
             <span class="tn">${s.title}</span>
