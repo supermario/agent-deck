@@ -57,6 +57,7 @@ type mobileTurn struct {
 	Role  string          `json:"role"`
 	Text  string          `json:"text"`
 	TS    string          `json:"ts"`
+	TsMs  int64           `json:"tsMs"` // last-record unix millis; 0 if unparseable
 	Tools []mobileToolRef `json:"tools"`
 }
 
@@ -415,6 +416,8 @@ func parseTranscriptTurns(path string) []mobileTurn {
 			role = hdr.Type
 		}
 
+		tsMs := parseTsMs(hdr.Timestamp)
+
 		switch role {
 		case "assistant":
 			text, tools := extractAssistantContent(msg.Content)
@@ -423,6 +426,7 @@ func parseTranscriptTurns(path string) []mobileTurn {
 					Role:  "assistant",
 					Text:  text,
 					TS:    hdr.Timestamp,
+					TsMs:  tsMs,
 					Tools: tools,
 				})
 			}
@@ -433,12 +437,25 @@ func parseTranscriptTurns(path string) []mobileTurn {
 					Role:  "user",
 					Text:  text,
 					TS:    hdr.Timestamp,
+					TsMs:  tsMs,
 					Tools: []mobileToolRef{},
 				})
 			}
 		}
 	}
 	return turns
+}
+
+// parseTsMs converts an RFC3339 record timestamp to unix milliseconds, or 0 if
+// it can't be parsed (so the phone can just skip the "… ago" label).
+func parseTsMs(ts string) int64 {
+	if ts == "" {
+		return 0
+	}
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t.UnixMilli()
+	}
+	return 0
 }
 
 // extractAssistantContent pulls concatenated text and tool_use references out of
