@@ -33,6 +33,13 @@ type mobileSession struct {
 	Tool     string `json:"tool"`
 	Status   string `json:"status"`
 	Substate string `json:"substate"`
+	// Prompt-cache countdown inputs, mirroring the DotfilesBar overlay
+	// (see overlay_push.go). The phone's "Recent" tab sorts by IdleSeconds
+	// and renders a local M:SS countdown of (TTLSeconds - IdleSeconds).
+	IdleSeconds int  `json:"idleSeconds"`
+	TTLSeconds  int  `json:"ttlSeconds"`
+	IsActive    bool `json:"isActive"`
+	NeedsInput  bool `json:"needsInput"`
 }
 
 type mobileSessionsResponse struct {
@@ -124,22 +131,68 @@ func (s *Server) handleMobileSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	refreshSnapshotHookStatuses(snapshot, s.hookStatusLoader)
 
+	now := time.Now()
 	out := mobileSessionsResponse{Sessions: []mobileSession{}}
 	for _, item := range snapshot.Items {
 		if item.Session == nil {
 			continue
 		}
 		se := item.Session
+		idle, ttl, active, needsInput := mobileSessionActivity(se, now)
 		out.Sessions = append(out.Sessions, mobileSession{
-			ID:       se.ID,
-			Title:    se.Title,
-			Group:    se.GroupPath,
-			Tool:     se.Tool,
-			Status:   string(se.Status),
-			Substate: se.Substate,
+			ID:          se.ID,
+			Title:       se.Title,
+			Group:       se.GroupPath,
+			Tool:        se.Tool,
+			Status:      string(se.Status),
+			Substate:    se.Substate,
+			IdleSeconds: idle,
+			TTLSeconds:  ttl,
+			IsActive:    active,
+			NeedsInput:  needsInput,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// mobileSessionActivity derives the prompt-cache countdown inputs for a session,
+// mirroring the DotfilesBar overlay's model (see overlay_push.go): the countdown
+// is anchored to the Claude transcript's last write (lastTurnAt), NOT to whether
+// a process is alive, so a lingering background shell doesn't keep it "active".
+//
+// Returns idleSeconds (since the last turn exchange), ttlSeconds (the cache TTL
+// for the tool), isActive (genuinely mid-turn), and needsInput. When no activity
+// time can be determined, idleSeconds is a large sentinel and ttlSeconds is 0 so
+// the session sorts to the bottom of a most-recent-first list and shows no
+// countdown.
+func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSeconds int, isActive, needsInput bool) {
+	ttlSeconds = cacheTTL(mapToolName(s.Tool))
+	needsInput = inputNeeded(s.ClaudeSessionID)
+	statusRunning := strings.ToLower(string(s.Status)) == "running"
+
+	if lastTurn := lastTurnAt(s.ProjectPath); !lastTurn.IsZero() {
+		since := now.Sub(lastTurn)
+		isActive = statusRunning && since < liveTurnWindow
+		if !isActive {
+			idleSeconds = int(since.Seconds())
+		}
+		return
+	}
+
+	// No transcript located (non-Claude tool, or unusual path): a running
+	// session counts as active; otherwise fall back to last-accessed time, or
+	// mark the activity time unknown.
+	if statusRunning {
+		isActive = true
+		return
+	}
+	if !s.LastAccessedAt.IsZero() {
+		idleSeconds = int(now.Sub(s.LastAccessedAt).Seconds())
+		return
+	}
+	idleSeconds = 1 << 30
+	ttlSeconds = 0
+	return
 }
 
 // ---- GET /api/mobile/session/{id}/transcript ----
