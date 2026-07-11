@@ -155,22 +155,27 @@ func (s *Server) handleMobileSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// mobileSessionActivity derives the prompt-cache countdown inputs for a session,
-// mirroring the DotfilesBar overlay's model (see overlay_push.go): the countdown
-// is anchored to the Claude transcript's last write (lastTurnAt), NOT to whether
-// a process is alive, so a lingering background shell doesn't keep it "active".
+// mobileSessionActivity derives the prompt-cache countdown inputs for a session:
+// idleSeconds (since the last turn exchange), ttlSeconds (the cache TTL for the
+// tool), isActive (genuinely mid-turn), and needsInput.
 //
-// Returns idleSeconds (since the last turn exchange), ttlSeconds (the cache TTL
-// for the tool), isActive (genuinely mid-turn), and needsInput. When no activity
-// time can be determined, idleSeconds is a large sentinel and ttlSeconds is 0 so
-// the session sorts to the bottom of a most-recent-first list and shows no
-// countdown.
+// Unlike the DotfilesBar overlay's lastTurnAt (which takes the newest .jsonl in
+// the working directory), this keys off THIS session's own Claude transcript,
+// identified by its ClaudeSessionID. That distinction matters on the phone,
+// which lists every session: many agent-deck sessions share one working
+// directory (e.g. several sessions all opened in ~/dev/projects/bento-life), and
+// "newest file in the cwd" would collapse them all to the same activity time.
+//
+// When no per-session transcript can be located (non-Claude tool, never ran, or
+// a rolled session-id whose file is gone) idleSeconds is a large sentinel and
+// ttlSeconds is 0, so the session sorts to the bottom of a most-recent-first
+// list and shows no countdown.
 func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSeconds int, isActive, needsInput bool) {
 	ttlSeconds = cacheTTL(mapToolName(s.Tool))
 	needsInput = inputNeeded(s.ClaudeSessionID)
 	statusRunning := strings.ToLower(string(s.Status)) == "running"
 
-	if lastTurn := lastTurnAt(s.ProjectPath); !lastTurn.IsZero() {
+	if lastTurn, ok := sessionOwnTranscriptMtime(s.ProjectPath, s.ClaudeSessionID); ok {
 		since := now.Sub(lastTurn)
 		isActive = statusRunning && since < liveTurnWindow
 		if !isActive {
@@ -179,9 +184,8 @@ func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSecon
 		return
 	}
 
-	// No transcript located (non-Claude tool, or unusual path): a running
-	// session counts as active; otherwise fall back to last-accessed time, or
-	// mark the activity time unknown.
+	// No per-session transcript located: a running session counts as active;
+	// otherwise fall back to last-accessed time, or mark it unknown.
 	if statusRunning {
 		isActive = true
 		return
@@ -193,6 +197,37 @@ func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSecon
 	idleSeconds = 1 << 30
 	ttlSeconds = 0
 	return
+}
+
+// sessionOwnTranscriptMtime returns the modification time of a specific session's
+// Claude transcript, resolved as <config>/projects/<cwd-slug>/<sessionID>.jsonl.
+// It checks the personal (~/.claude) and work (~/.claude-work) config dirs and
+// takes the newest match. Keying by sessionID - rather than globbing the cwd -
+// is what lets sessions sharing a working directory report distinct activity
+// times. Returns ok=false when the id is empty or no such file exists.
+func sessionOwnTranscriptMtime(cwd, claudeSessionID string) (time.Time, bool) {
+	if cwd == "" || claudeSessionID == "" {
+		return time.Time{}, false
+	}
+	resolved := cwd
+	if r, err := filepath.EvalSymlinks(cwd); err == nil {
+		resolved = r
+	}
+	dirName := session.ConvertToClaudeDirName(resolved)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return time.Time{}, false
+	}
+	var newest time.Time
+	found := false
+	for _, cfg := range []string{".claude", ".claude-work"} {
+		f := filepath.Join(home, cfg, "projects", dirName, claudeSessionID+".jsonl")
+		if fi, err := os.Stat(f); err == nil && (!found || fi.ModTime().After(newest)) {
+			newest = fi.ModTime()
+			found = true
+		}
+	}
+	return newest, found
 }
 
 // ---- GET /api/mobile/session/{id}/transcript ----
