@@ -124,6 +124,12 @@ func (o *overlayPusher) push(ctx context.Context) {
 
 	now := time.Now()
 	var sessions []overlaySession
+	// Serialize the whole scan: it reads and writes o.idleSince / o.lastStatus,
+	// and triggerAsync fires push() in a fresh goroutine each trigger. Two
+	// overlapping pushes writing these maps crash the process with a fatal
+	// "concurrent map writes". Pushes are infrequent, so holding the lock
+	// across the loop (which also does light transcript IO) is cheap.
+	o.mu.Lock()
 	for _, item := range snapshot.Items {
 		if item.Type != MenuItemTypeSession || item.Session == nil {
 			continue
@@ -139,28 +145,63 @@ func (o *overlayPusher) push(ctx context.Context) {
 			continue
 		}
 
-		isActive := status == "running"
-		wasActive := o.lastStatus[s.ID]
+		statusRunning := status == "running"
 
-		if isActive {
-			delete(o.idleSince, s.ID)
-		} else if wasActive {
-			o.idleSince[s.ID] = now
-		} else if o.idleSince[s.ID].IsZero() {
-			if !s.LastAccessedAt.IsZero() {
-				o.idleSince[s.ID] = s.LastAccessedAt
+		// The overlay tracks the LLM prompt-cache TTL, which is anchored to
+		// the last turn exchange — NOT to whether a process is alive.
+		// agent-deck marks a session "running" whenever a background shell is
+		// still up (e.g. a dev server launched via run_in_background), which
+		// would wrongly keep the session spinning forever and never start the
+		// cache countdown. Anchor to the last genuine turn recorded in this
+		// session's own transcript (by ClaudeSessionID, not the newest file in
+		// the cwd), read from the record timestamp rather than the file mtime —
+		// mtime gets bumped by session-resume/housekeeping without a new turn,
+		// which made idle sessions look recently active (see handlers_mobile.go).
+		var lastTurn time.Time
+		if path, ok := sessionTranscriptPath(s.ProjectPath, s.ClaudeSessionID); ok {
+			if ts, ok2 := lastTurnTimestamp(path); ok2 {
+				lastTurn = ts
+			}
+		}
+
+		var isActive bool
+		var idleSecs int
+		if !lastTurn.IsZero() {
+			since := now.Sub(lastTurn)
+			// Only "active" (spinner) while the LLM is genuinely mid-turn:
+			// agent-deck sees a spinner AND the transcript is still being
+			// written. A stale transcript under a "running" status is the
+			// background-shell case → fall through to the countdown.
+			isActive = statusRunning && since < liveTurnWindow
+			if isActive {
+				delete(o.idleSince, s.ID)
 			} else {
+				o.idleSince[s.ID] = lastTurn
+				idleSecs = int(since.Seconds())
+			}
+		} else {
+			// No transcript located (non-Claude tool, or unusual path): fall
+			// back to the prior status-transition heuristic.
+			isActive = statusRunning
+			wasActive := o.lastStatus[s.ID]
+			if isActive {
+				delete(o.idleSince, s.ID)
+			} else if wasActive {
 				o.idleSince[s.ID] = now
+			} else if o.idleSince[s.ID].IsZero() {
+				if !s.LastAccessedAt.IsZero() {
+					o.idleSince[s.ID] = s.LastAccessedAt
+				} else {
+					o.idleSince[s.ID] = now
+				}
+			}
+			if !isActive {
+				if since, ok := o.idleSince[s.ID]; ok {
+					idleSecs = int(now.Sub(since).Seconds())
+				}
 			}
 		}
 		o.lastStatus[s.ID] = isActive
-
-		idleSecs := 0
-		if !isActive {
-			if since, ok := o.idleSince[s.ID]; ok {
-				idleSecs = int(now.Sub(since).Seconds())
-			}
-		}
 
 		ttl := cacheTTL(tool)
 		if !isActive && idleSecs > ttl+3600 {
@@ -179,6 +220,7 @@ func (o *overlayPusher) push(ctx context.Context) {
 			NeedsInput: inputNeeded(s.ClaudeSessionID),
 		})
 	}
+	o.mu.Unlock()
 
 	payload := overlayPayload{Source: "agent-deck", Sessions: sessions, Usage: readUsage()}
 	body, err := json.Marshal(payload)
@@ -238,6 +280,14 @@ func cacheTTL(tool string) int {
 		return 3600
 	}
 }
+
+// liveTurnWindow is how recently the Claude transcript must have been written
+// for a "running" session to still count as a genuinely live turn (spinner)
+// rather than a background-shell false-active. Comfortably longer than the
+// gaps between transcript writes during a normal turn (streamed messages,
+// tool calls), but short enough that an idle session with a lingering
+// background process settles to the cache countdown.
+const liveTurnWindow = 120 * time.Second
 
 func openCommand(s *MenuSession) string {
 	if s.ClaudeSessionID != "" {
