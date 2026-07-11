@@ -13,7 +13,9 @@ package web
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -175,13 +177,15 @@ func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSecon
 	needsInput = inputNeeded(s.ClaudeSessionID)
 	statusRunning := strings.ToLower(string(s.Status)) == "running"
 
-	if lastTurn, ok := sessionOwnTranscriptMtime(s.ProjectPath, s.ClaudeSessionID); ok {
-		since := now.Sub(lastTurn)
-		isActive = statusRunning && since < liveTurnWindow
-		if !isActive {
-			idleSeconds = int(since.Seconds())
+	if path, ok := sessionTranscriptPath(s.ProjectPath, s.ClaudeSessionID); ok {
+		if lastTurn, ok2 := lastTurnTimestamp(path); ok2 {
+			since := now.Sub(lastTurn)
+			isActive = statusRunning && since < liveTurnWindow
+			if !isActive {
+				idleSeconds = int(since.Seconds())
+			}
+			return
 		}
-		return
 	}
 
 	// No per-session transcript located: a running session counts as active;
@@ -199,15 +203,14 @@ func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSecon
 	return
 }
 
-// sessionOwnTranscriptMtime returns the modification time of a specific session's
-// Claude transcript, resolved as <config>/projects/<cwd-slug>/<sessionID>.jsonl.
-// It checks the personal (~/.claude) and work (~/.claude-work) config dirs and
-// takes the newest match. Keying by sessionID - rather than globbing the cwd -
-// is what lets sessions sharing a working directory report distinct activity
-// times. Returns ok=false when the id is empty or no such file exists.
-func sessionOwnTranscriptMtime(cwd, claudeSessionID string) (time.Time, bool) {
+// sessionTranscriptPath resolves a specific session's Claude transcript file,
+// <config>/projects/<cwd-slug>/<sessionID>.jsonl, checking the personal
+// (~/.claude) and work (~/.claude-work) config dirs and returning the newest
+// existing match. Keying by sessionID - rather than globbing the cwd - is what
+// lets sessions sharing a working directory resolve to distinct files.
+func sessionTranscriptPath(cwd, claudeSessionID string) (string, bool) {
 	if cwd == "" || claudeSessionID == "" {
-		return time.Time{}, false
+		return "", false
 	}
 	resolved := cwd
 	if r, err := filepath.EvalSymlinks(cwd); err == nil {
@@ -216,18 +219,76 @@ func sessionOwnTranscriptMtime(cwd, claudeSessionID string) (time.Time, bool) {
 	dirName := session.ConvertToClaudeDirName(resolved)
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return time.Time{}, false
+		return "", false
 	}
-	var newest time.Time
-	found := false
+	var newestPath string
+	var newestMod time.Time
 	for _, cfg := range []string{".claude", ".claude-work"} {
 		f := filepath.Join(home, cfg, "projects", dirName, claudeSessionID+".jsonl")
-		if fi, err := os.Stat(f); err == nil && (!found || fi.ModTime().After(newest)) {
-			newest = fi.ModTime()
-			found = true
+		if fi, err := os.Stat(f); err == nil && (newestPath == "" || fi.ModTime().After(newestMod)) {
+			newestPath = f
+			newestMod = fi.ModTime()
 		}
 	}
-	return newest, found
+	return newestPath, newestPath != ""
+}
+
+// lastTurnTimestamp returns the timestamp of the last genuine user/assistant
+// message record in a Claude transcript. This is the true "last turn ended"
+// time - unlike the file mtime, which gets bumped when the file is re-touched
+// (session resume, housekeeping) without any new turn, making an old idle
+// session look recently active. Reads only the file's tail for efficiency.
+func lastTurnTimestamp(path string) (time.Time, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return time.Time{}, false
+	}
+	const tailBytes int64 = 1 << 20 // 1MB tail: comfortably covers the last several turns
+	if fi.Size() > tailBytes {
+		if _, err := f.Seek(fi.Size()-tailBytes, io.SeekStart); err != nil {
+			return time.Time{}, false
+		}
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	lines := bytes.Split(data, []byte{'\n'})
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 {
+			continue
+		}
+		var hdr struct {
+			Type        string `json:"type"`
+			Timestamp   string `json:"timestamp"`
+			IsSidechain bool   `json:"isSidechain"`
+			Message     struct {
+				Role string `json:"role"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &hdr) != nil || hdr.IsSidechain || hdr.Timestamp == "" {
+			continue
+		}
+		role := hdr.Message.Role
+		if role == "" {
+			role = hdr.Type
+		}
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		if ts, err := time.Parse(time.RFC3339Nano, hdr.Timestamp); err == nil {
+			return ts, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // ---- GET /api/mobile/session/{id}/transcript ----
