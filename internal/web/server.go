@@ -325,6 +325,16 @@ func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
 }
 
+// DisableOverlayPusher stops this server from pushing session state to the
+// desktop overlay (localhost:27015). Headless (--no-tui) servers are designed
+// to coexist with the interactive TUI, which owns the overlay; if both push,
+// they clobber each other every cycle on the shared "agent-deck" source (the
+// TUI's full view vs. the headless server's partial one). Must be called before
+// Start(); the periodic-push and trigger paths already guard on a nil overlay.
+func (s *Server) DisableOverlayPusher() {
+	s.overlay = nil
+}
+
 // Start starts the HTTP server and blocks until shutdown or error.
 // Returns nil on graceful shutdown.
 func (s *Server) Start() error {

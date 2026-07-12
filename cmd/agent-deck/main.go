@@ -884,6 +884,9 @@ func main() {
 			// fallback when MemoryMenuData has no snapshot, so the web UI
 			// reads live data from storage on each request.
 			fmt.Println("Headless mode: TUI disabled")
+			// The interactive TUI owns the desktop overlay; a headless server
+			// that also pushed would fight it on the shared "agent-deck" source.
+			server.DisableOverlayPusher()
 			fmt.Printf("Web server: http://%s\n", server.Addr())
 			defer func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
