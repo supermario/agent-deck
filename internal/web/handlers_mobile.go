@@ -19,7 +19,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/send"
@@ -65,7 +67,8 @@ type mobileTranscriptResponse struct {
 	ID     string       `json:"id"`
 	Title  string       `json:"title"`
 	Status string       `json:"status"`
-	Turns  []mobileTurn `json:"turns"`
+	Turns  []mobileTurn `json:"turns"` // when afterIndex is given, only turns after it
+	Total  int          `json:"total"` // total turn count on the server (for incremental sync)
 }
 
 // ---- shared helpers ----
@@ -318,6 +321,17 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 	// compaction) so we resolve the currently-active transcript file.
 	inst.RefreshLiveSessionIDs()
 
+	// afterIndex lets the phone fetch only turns newer than what it already has,
+	// so watching a live conversation transfers a few KB instead of the whole
+	// transcript each poll. total is always the full count so the client can
+	// detect a reset (session /clear-roll) when total < its own count.
+	afterIndex := 0
+	if v := r.URL.Query().Get("afterIndex"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n >= 0 {
+			afterIndex = n
+		}
+	}
+
 	resp := mobileTranscriptResponse{
 		ID:     inst.ID,
 		Title:  inst.Title,
@@ -330,7 +344,17 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 		path = latestTranscriptOnDisk(inst)
 	}
 	if path != "" {
-		resp.Turns = parseTranscriptTurns(path)
+		all := cachedTranscriptTurns(path)
+		resp.Total = len(all)
+		if afterIndex > 0 {
+			if afterIndex <= len(all) {
+				resp.Turns = all[afterIndex:]
+			}
+			// afterIndex > len(all): the client is ahead (roll); leave Turns
+			// empty - it will full-refetch on seeing total < its count.
+		} else {
+			resp.Turns = all
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -370,80 +394,133 @@ func latestTranscriptOnDisk(inst *session.Instance) string {
 	return newest
 }
 
-// parseTranscriptTurns reads a full Claude JSONL transcript and flattens it into
-// chat turns: genuine human user messages and assistant messages (text +
-// collapsed tool_use calls). Sidechain (subagent) records and pure tool_result
-// user records are skipped.
-func parseTranscriptTurns(path string) []mobileTurn {
+// transcriptCache memoizes parsed turns per file so re-fetches (polling a live
+// conversation) don't re-parse the whole JSONL. Claude appends whole lines to a
+// given session file and never rewrites it, so we cache the parsed turns plus
+// the byte offset of the last complete line and, on the next read, parse only
+// the appended bytes. A rolled session resolves to a different path (fresh
+// cache entry); a truncated file (size < offset) triggers a full re-parse.
+type transcriptCacheEntry struct {
+	offset int64
+	turns  []mobileTurn
+}
+
+var (
+	transcriptCacheMu sync.Mutex
+	transcriptCache   = map[string]*transcriptCacheEntry{}
+)
+
+func cachedTranscriptTurns(path string) []mobileTurn {
+	transcriptCacheMu.Lock()
+	defer transcriptCacheMu.Unlock()
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		turns, _ := parseTranscriptFrom(path, 0)
+		return turns
+	}
+
+	entry := transcriptCache[path]
+	if entry == nil || fi.Size() < entry.offset {
+		turns, off := parseTranscriptFrom(path, 0)
+		transcriptCache[path] = &transcriptCacheEntry{offset: off, turns: turns}
+		return turns
+	}
+	if fi.Size() > entry.offset {
+		newTurns, off := parseTranscriptFrom(path, entry.offset)
+		if len(newTurns) > 0 {
+			entry.turns = append(entry.turns, newTurns...)
+		}
+		entry.offset = off
+	}
+	return entry.turns
+}
+
+// parseTranscriptFrom reads a Claude JSONL transcript starting at byte offset
+// start, flattening genuine user/assistant records into chat turns. It only
+// consumes complete lines (ending in '\n'); the returned offset is the position
+// after the last complete line, so a partially-written trailing record is
+// re-read next time rather than parsed truncated.
+func parseTranscriptFrom(path string, start int64) ([]mobileTurn, int64) {
 	turns := []mobileTurn{}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return turns
+		return turns, start
 	}
 	defer func() { _ = f.Close() }()
 
-	sc := bufio.NewScanner(f)
-	// Claude records can be large (big tool_results/pastes); raise the line cap.
-	sc.Buffer(make([]byte, 0, 1024*1024), 32*1024*1024)
-
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var hdr struct {
-			Type        string          `json:"type"`
-			Timestamp   string          `json:"timestamp"`
-			IsSidechain bool            `json:"isSidechain"`
-			Message     json.RawMessage `json:"message"`
-		}
-		if err := json.Unmarshal(line, &hdr); err != nil {
-			continue
-		}
-		if hdr.IsSidechain || len(hdr.Message) == 0 {
-			continue
-		}
-		var msg struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		}
-		if err := json.Unmarshal(hdr.Message, &msg); err != nil {
-			continue
-		}
-		role := msg.Role
-		if role == "" {
-			role = hdr.Type
-		}
-
-		tsMs := parseTsMs(hdr.Timestamp)
-
-		switch role {
-		case "assistant":
-			text, tools := extractAssistantContent(msg.Content)
-			if text != "" || len(tools) > 0 {
-				turns = append(turns, mobileTurn{
-					Role:  "assistant",
-					Text:  text,
-					TS:    hdr.Timestamp,
-					TsMs:  tsMs,
-					Tools: tools,
-				})
-			}
-		case "user":
-			text := extractUserText(msg.Content)
-			if strings.TrimSpace(text) != "" && !isNoiseUserText(text) {
-				turns = append(turns, mobileTurn{
-					Role:  "user",
-					Text:  text,
-					TS:    hdr.Timestamp,
-					TsMs:  tsMs,
-					Tools: []mobileToolRef{},
-				})
-			}
+	if start > 0 {
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			return turns, start
 		}
 	}
-	return turns
+
+	r := bufio.NewReaderSize(f, 1024*1024)
+	offset := start
+	for {
+		line, err := r.ReadBytes('\n')
+		if err == nil {
+			// Complete line (delimiter included).
+			offset += int64(len(line))
+			if turn, ok := parseTurnLine(line); ok {
+				turns = append(turns, turn)
+			}
+			continue
+		}
+		// err != nil: ReadBytes returned the trailing bytes without a delimiter
+		// (partial last record) - leave the offset before it and stop.
+		break
+	}
+	return turns, offset
+}
+
+// parseTurnLine parses one JSONL record into a chat turn. ok is false for
+// records that aren't displayed turns (sidechain, tool_result-only user records,
+// Claude Code plumbing, empty assistant records).
+func parseTurnLine(line []byte) (mobileTurn, bool) {
+	if len(strings.TrimSpace(string(line))) == 0 {
+		return mobileTurn{}, false
+	}
+	var hdr struct {
+		Type        string          `json:"type"`
+		Timestamp   string          `json:"timestamp"`
+		IsSidechain bool            `json:"isSidechain"`
+		Message     json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(line, &hdr); err != nil {
+		return mobileTurn{}, false
+	}
+	if hdr.IsSidechain || len(hdr.Message) == 0 {
+		return mobileTurn{}, false
+	}
+	var msg struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(hdr.Message, &msg); err != nil {
+		return mobileTurn{}, false
+	}
+	role := msg.Role
+	if role == "" {
+		role = hdr.Type
+	}
+
+	tsMs := parseTsMs(hdr.Timestamp)
+
+	switch role {
+	case "assistant":
+		text, tools := extractAssistantContent(msg.Content)
+		if text != "" || len(tools) > 0 {
+			return mobileTurn{Role: "assistant", Text: text, TS: hdr.Timestamp, TsMs: tsMs, Tools: tools}, true
+		}
+	case "user":
+		text := extractUserText(msg.Content)
+		if strings.TrimSpace(text) != "" && !isNoiseUserText(text) {
+			return mobileTurn{Role: "user", Text: text, TS: hdr.Timestamp, TsMs: tsMs, Tools: []mobileToolRef{}}, true
+		}
+	}
+	return mobileTurn{}, false
 }
 
 // parseTsMs converts an RFC3339 record timestamp to unix milliseconds, or 0 if
@@ -640,17 +717,16 @@ func (s *Server) handleMobileSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Best-effort readiness wait so the composer is mounted before we type;
-	// proceed regardless (v1 favors responsiveness over the CLI's full retry
-	// harness).
-	_ = send.WaitForAgentReady(tmuxSess, inst.Tool, 8*time.Second, send.PromptGates{
-		ClaudeComposer: session.IsClaudeCompatible(inst.Tool),
-		CodexPrompt:    session.IsCodexCompatible(inst.Tool),
-	})
-
-	if err := tmuxSess.SendKeysAndEnter(text); err != nil {
-		writeMobileError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	// Fire the readiness wait + keystrokes in the background and ack the phone
+	// immediately: WaitForAgentReady can block for seconds while the composer
+	// mounts, and the phone already echoes the message optimistically, so there
+	// is nothing to gain from making it wait on the HTTP response.
+	go func() {
+		_ = send.WaitForAgentReady(tmuxSess, inst.Tool, 8*time.Second, send.PromptGates{
+			ClaudeComposer: session.IsClaudeCompatible(inst.Tool),
+			CodexPrompt:    session.IsCodexCompatible(inst.Tool),
+		})
+		_ = tmuxSess.SendKeysAndEnter(text)
+	}()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
