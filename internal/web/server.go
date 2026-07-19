@@ -348,6 +348,23 @@ func (s *Server) Start() error {
 	}
 
 	webLog := logging.ForComponent(logging.CompWeb)
+
+	// Backfill lifecycle hooks into every known Claude config dir (work profile,
+	// group/account overrides), not just the default. Sessions under a
+	// non-default config dir otherwise never fire hooks, so a resume-fork leaves
+	// their stored ClaudeSessionID stale and the phone/overlay resolve an old
+	// transcript. Gated on the default dir already having hooks: that is the
+	// signal the user consented to hook installation (consent is per-user, not
+	// per-dir), so we never write hooks the user didn't agree to.
+	if session.CheckClaudeHooksInstalled(session.GetClaudeConfigDir()) {
+		userConfig, _ := session.LoadUserConfig()
+		if installed, err := session.EnsureClaudeHooksInAllConfigDirs(userConfig); err != nil {
+			webLog.Warn("claude_hooks_backfill_failed", slog.String("error", err.Error()))
+		} else if len(installed) > 0 {
+			webLog.Info("claude_hooks_backfilled", slog.Any("config_dirs", installed))
+		}
+	}
+
 	if watcher, err := session.NewStatusFileWatcher(func() {
 		s.notifyMenuChanged()
 		if s.push != nil {

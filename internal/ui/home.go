@@ -1765,6 +1765,14 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 				h.hookWatcher = hookWatcher
 				go hookWatcher.Start()
 			}
+			// Default dir has hooks => consent was given. Backfill any other
+			// config dir (work profile, group/account override) that's missing
+			// them, so its sessions report status/session-id too.
+			if installed, err := session.EnsureClaudeHooksInAllConfigDirs(userConfig); err != nil {
+				uiLog.Warn("hook_backfill_failed", slog.String("error", err.Error()))
+			} else if len(installed) > 0 {
+				uiLog.Info("claude_hooks_backfilled", slog.Any("config_dirs", installed))
+			}
 		} else {
 			// Hooks not installed: check if user was already prompted
 			prompted := false
@@ -1772,11 +1780,12 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 				if val, err := db.GetMeta("hooks_prompted"); err == nil && val != "" {
 					prompted = true
 					if val == "accepted" {
-						// User previously accepted but hooks got removed: re-install silently
-						if _, err := session.InjectClaudeHooks(configDir); err != nil {
+						// User previously accepted but hooks got removed: re-install
+						// silently across every known config dir (not just default).
+						if installed, err := session.EnsureClaudeHooksInAllConfigDirs(userConfig); err != nil {
 							uiLog.Warn("hook_reinstall_failed", slog.String("error", err.Error()))
 						} else {
-							uiLog.Info("claude_hooks_reinstalled", slog.String("config_dir", configDir))
+							uiLog.Info("claude_hooks_reinstalled", slog.Any("config_dirs", installed))
 						}
 						hookWatcher, err := session.NewStatusFileWatcher(nil)
 						if err != nil {
@@ -10290,11 +10299,19 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 func (h *Home) confirmInstallHooks() tea.Cmd {
 	h.confirmDialog.Hide()
 	h.pendingHooksPrompt = false
+	// Install into the default config dir plus every other known dir (work
+	// profile, group/account overrides), so all sessions report status/session-id.
 	configDir := session.GetClaudeConfigDir()
 	if _, err := session.InjectClaudeHooks(configDir); err != nil {
 		uiLog.Warn("hook_install_failed", slog.String("error", err.Error()))
 	} else {
 		uiLog.Info("claude_hooks_installed", slog.String("config_dir", configDir))
+	}
+	userConfig, _ := session.LoadUserConfig()
+	if installed, err := session.EnsureClaudeHooksInAllConfigDirs(userConfig); err != nil {
+		uiLog.Warn("hook_backfill_failed", slog.String("error", err.Error()))
+	} else if len(installed) > 0 {
+		uiLog.Info("claude_hooks_backfilled", slog.Any("config_dirs", installed))
 	}
 	// Start the status file watcher
 	hookWatcher, err := session.NewStatusFileWatcher(nil)

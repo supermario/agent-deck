@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/atomicfile"
@@ -130,6 +131,127 @@ func InjectClaudeHooks(configDir string) (bool, error) {
 
 	sessionLog.Info("claude_hooks_installed", slog.String("config_dir", configDir))
 	return true, nil
+}
+
+// KnownClaudeConfigDirs returns every Claude config dir agent-deck may spawn a
+// session into: the legacy ~/.claude + ~/.claude-work pair, the global
+// [claude].config_dir, and every [profiles.*], [groups.*] and [conductors.*]
+// claude.config_dir override. Paths are ExpandPath-expanded and
+// symlink-deduplicated; ~/.claude is always first, the rest follow in stable
+// (sorted-key) order.
+//
+// Lifecycle hooks must be installed into EACH of these, not just the default
+// (GetClaudeConfigDir). A session launched under a non-default config dir - e.g.
+// a "work" profile writing to ~/.claude-work - otherwise never fires agent-deck's
+// hooks, so its current Claude session_id is never learned. When such a session
+// resume-forks (Claude starts a new transcript UUID mid-run), the stored
+// ClaudeSessionID goes stale and transcript reads resolve to the OLD file. This
+// mirrors credConfigDirCandidates, which fixed the same hardcoded-pair gap for
+// credential keep-warm (issue #1414).
+func KnownClaudeConfigDirs(cfg *UserConfig) []string {
+	var candidates []string
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(home, ".claude"),
+			filepath.Join(home, ".claude-work"),
+		)
+	}
+	if cfg != nil {
+		if cfg.Claude.ConfigDir != "" {
+			candidates = append(candidates, cfg.Claude.ConfigDir)
+		}
+		appendSorted := func(get func() []string) {
+			candidates = append(candidates, get()...)
+		}
+		appendSorted(func() []string { return claudeConfigDirsFromProfiles(cfg) })
+		appendSorted(func() []string { return claudeConfigDirsFromGroups(cfg) })
+		appendSorted(func() []string { return claudeConfigDirsFromConductors(cfg) })
+	}
+
+	out := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, d := range candidates {
+		dir := ExpandPath(d)
+		key := dir
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			key = resolved
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, dir)
+	}
+	return out
+}
+
+func claudeConfigDirsFromProfiles(cfg *UserConfig) []string {
+	var out []string
+	for _, name := range sortedClaudeConfigKeys(cfg.Profiles) {
+		if d := cfg.Profiles[name].Claude.ConfigDir; d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func claudeConfigDirsFromGroups(cfg *UserConfig) []string {
+	var out []string
+	for _, name := range sortedClaudeConfigKeys(cfg.Groups) {
+		if d := cfg.Groups[name].Claude.ConfigDir; d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func claudeConfigDirsFromConductors(cfg *UserConfig) []string {
+	var out []string
+	for _, name := range sortedClaudeConfigKeys(cfg.Conductors) {
+		if d := cfg.Conductors[name].Claude.ConfigDir; d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func sortedClaudeConfigKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// EnsureClaudeHooksInAllConfigDirs installs agent-deck lifecycle hooks into
+// every EXISTING known Claude config dir that lacks them, returning the dirs it
+// newly wrote to. Idempotent: dirs that already have the hooks are skipped.
+//
+// Only call once the user has consented to hook installation (the one-time
+// global prompt). Consent is per-user, not per-config-dir, so once granted it
+// applies to every dir agent-deck spawns sessions into. Config dirs that don't
+// exist on disk are skipped rather than created, so a declared-but-never-used
+// profile doesn't get an empty settings.json.
+func EnsureClaudeHooksInAllConfigDirs(cfg *UserConfig) (installed []string, firstErr error) {
+	for _, dir := range KnownClaudeConfigDirs(cfg) {
+		if _, statErr := os.Stat(dir); statErr != nil {
+			continue // don't create config dirs that don't exist
+		}
+		if CheckClaudeHooksInstalled(dir) {
+			continue
+		}
+		if _, err := InjectClaudeHooks(dir); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			sessionLog.Warn("claude_hooks_backfill_failed",
+				slog.String("config_dir", dir), slog.String("error", err.Error()))
+			continue
+		}
+		installed = append(installed, dir)
+	}
+	return installed, firstErr
 }
 
 // RemoveClaudeHooks removes agent-deck hook entries from Claude Code's settings.json.
