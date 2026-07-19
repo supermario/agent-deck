@@ -1,0 +1,81 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "curl": {
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D#curl",
+      "source": "nixpkg"
+    },
+    "git": {
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D#git",
+      "source": "nixpkg"
+    },
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-04-06T08:39:25Z",
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?lastModified=1775464765&narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D"
+    },
+    "gnumake": {
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D#gnumake",
+      "source": "nixpkg"
+    },
+    "go@1.25": {
+      "last_modified": "2026-06-05T19:07:58Z",
+      "resolved": "github:NixOS/nixpkgs/891eaa77f0eed53352194677991bd30978f9b0ad#go_1_25",
+      "source": "devbox-search",
+      "version": "1.25.11",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ddbcn4a5wk9ds6akinh789yqarn3v5ym-go-1.25.11",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ddbcn4a5wk9ds6akinh789yqarn3v5ym-go-1.25.11"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/mwpzyb97adnfp5kd7fvhy4kxm7mvnfyv-go-1.25.11",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/mwpzyb97adnfp5kd7fvhy4kxm7mvnfyv-go-1.25.11"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/mv43xdg6g66w8jw3gp9b7i124iy3pyqs-go-1.25.11",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/mv43xdg6g66w8jw3gp9b7i124iy3pyqs-go-1.25.11"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/zkkhcz8rd5q5y3gv27yq1ikdcrdhgir2-go-1.25.11",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/zkkhcz8rd5q5y3gv27yq1ikdcrdhgir2-go-1.25.11"
+        }
+      }
+    },
+    "golangci-lint": {
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D#golangci-lint",
+      "source": "nixpkg"
+    },
+    "goreleaser": {
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D#goreleaser",
+      "source": "nixpkg"
+    },
+    "lefthook": {
+      "resolved": "github:NixOS/nixpkgs/83e29f2b8791f6dec20804382fcd9a666d744c07?narHash=sha256-nex6TL2x1%2FsVHCyDWcvl1t%2FdbTedb9bAGC4DLf%2FpmYk%3D#lefthook",
+      "source": "nixpkg"
+    }
+  }
+}

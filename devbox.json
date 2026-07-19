@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.14.0/.schema/devbox.schema.json",
+  "packages": [
+    "go@1.25",
+    "git",
+    "curl",
+    "gnumake",
+    "golangci-lint",
+    "lefthook",
+    "goreleaser"
+  ],
+  "shell": {
+    "init_hook": [
+      "export GOTOOLCHAIN=auto"
+    ],
+    "scripts": {
+      "build": "make build",
+      "install": "make install",
+      "test": "make test",
+      "lint": "make lint",
+      "dev": "make dev",
+      "css": "make css"
+    }
+  }
+}
