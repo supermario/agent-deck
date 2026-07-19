@@ -128,10 +128,9 @@ func (s *Server) handleMobileStream(w http.ResponseWriter, r *http.Request) {
 	cfg := session.StreamConfig{IdleTimeout: 24 * time.Hour}
 	for ctx.Err() == nil {
 		inst.RefreshLiveSessionIDs()
-		path := inst.GetJSONLPath()
-		if path == "" {
-			path = latestTranscriptOnDisk(inst)
-		}
+		// Strict per-session resolution — see handleMobileTranscript: never fall
+		// back to newest-in-cwd, which streams a co-located sibling's turns.
+		path := inst.GetJSONLPathForInstance()
 		if path == "" {
 			if sleepCtx(ctx, 500*time.Millisecond) {
 				return

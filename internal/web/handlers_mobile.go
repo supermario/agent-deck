@@ -339,10 +339,14 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 		Turns:  []mobileTurn{},
 	}
 
-	path := inst.GetJSONLPath()
-	if path == "" {
-		path = latestTranscriptOnDisk(inst)
-	}
+	// Resolve strictly by this session's own ID under its own config dir. We do
+	// NOT fall back to "newest .jsonl in the cwd": sessions routinely share a
+	// working directory (e.g. several sessions sharing one working directory), and
+	// newest-in-cwd collapses a just-opened session onto whichever sibling was
+	// written most recently — the reported co-located-session
+	// mixup. If this session has no resolvable transcript yet, an empty result
+	// is the honest answer, not a sibling's history.
+	path := inst.GetJSONLPathForInstance()
 	if path != "" {
 		all := cachedTranscriptTurns(path)
 		resp.Total = len(all)
@@ -357,41 +361,6 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// latestTranscriptOnDisk is the fallback when the stored UUID doesn't resolve to
-// a file: pick the newest .jsonl in the session's Claude project directory.
-func latestTranscriptOnDisk(inst *session.Instance) string {
-	if !session.IsClaudeCompatible(inst.Tool) {
-		return ""
-	}
-	configDir := session.GetClaudeConfigDirForInstance(inst)
-	resolved := inst.ProjectPath
-	if r, err := filepath.EvalSymlinks(inst.ProjectPath); err == nil {
-		resolved = r
-	}
-	dir := filepath.Join(configDir, "projects", session.ConvertToClaudeDirName(resolved))
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	var newest string
-	var newestMod time.Time
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if newest == "" || info.ModTime().After(newestMod) {
-			newest = filepath.Join(dir, e.Name())
-			newestMod = info.ModTime()
-		}
-	}
-	return newest
 }
 
 // transcriptCache memoizes parsed turns per file so re-fetches (polling a live

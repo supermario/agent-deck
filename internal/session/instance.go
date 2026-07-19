@@ -7627,6 +7627,22 @@ func (i *Instance) GetJSONLPath() string {
 	return resolveClaudeTranscriptPath(GetClaudeConfigDir(), i.ProjectPath, i.ClaudeSessionID)
 }
 
+// GetJSONLPathForInstance is like GetJSONLPath but resolves against THIS
+// instance's own Claude config dir (personal ~/.claude vs work ~/.claude-work
+// vs a per-group/conductor override) instead of the shell-wide default. Use it
+// wherever the transcript must belong to exactly this session and no other:
+// GetJSONLPath hardcodes GetClaudeConfigDir(), so a work session's transcript
+// (which lives under ~/.claude-work) misses, and callers that then fall back to
+// "newest .jsonl in the cwd" collapse co-located siblings onto whichever was
+// touched last (the co-located-session mixup). Keying by the
+// session's own ID under its own config dir keeps siblings distinct.
+func (i *Instance) GetJSONLPathForInstance() string {
+	if !IsClaudeCompatible(i.Tool) || i.ClaudeSessionID == "" {
+		return ""
+	}
+	return resolveClaudeTranscriptPath(GetClaudeConfigDirForInstance(i), i.ProjectPath, i.ClaudeSessionID)
+}
+
 // getClaudeLastResponse extracts the last assistant message from Claude's JSONL file
 func (i *Instance) getClaudeLastResponse() (*ResponseOutput, error) {
 	// Require stored session ID - no fallback to file scanning
