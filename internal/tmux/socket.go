@@ -214,6 +214,27 @@ func tmuxExecContext(ctx context.Context, socketName string, args ...string) *ex
 	return cmd
 }
 
+// CaptureVisibleBySocket returns the visible pane text for a session via a
+// one-shot `capture-pane -p`, targeting the given socket (empty = default).
+// It is socket-aware so it reaches the right tmux server — a bare `tmux` exec
+// would hit the default socket. Used by the overlay pusher to read the Claude
+// footer status line (e.g. the running background-shell count).
+func CaptureVisibleBySocket(socketName, sessionName string) (string, error) {
+	// Empty per-session socket means the default server — target it by name
+	// (as agent-deck's other default-socket ops do) rather than a bare `tmux`
+	// that would trust an ambient (possibly polluted) $TMUX / TMUX_TMPDIR.
+	if strings.TrimSpace(socketName) == "" {
+		socketName = DefaultSocketName()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := tmuxExecContext(ctx, socketName, "capture-pane", "-t", sessionName, "-p").Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
 // tmuxCmd is the per-Session convenience wrapper. Every tmux subprocess
 // spawned for a specific session must target the socket that session was
 // created under — even if the installation-wide config later changes.
