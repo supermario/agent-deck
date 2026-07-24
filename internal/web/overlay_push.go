@@ -307,8 +307,7 @@ func openCommand(s *MenuSession) string {
 // by Claude session_id; PostToolUse removes it. A stale guard ignores markers
 // older than 1h in case a clear was missed (session killed mid-question).
 // shellCountRe matches the running-shell segment of the Claude footer status
-// line, e.g. "· 2 shells ·" or "· 1 shell ·". The dot prefix keeps it off the
-// spinner line ("… · 2 shells still running"), which we also skip explicitly.
+// line, e.g. "· 2 shells ·" or "· 1 shell ·".
 var shellCountRe = regexp.MustCompile(`·\s*(\d+)\s+shells?\b`)
 
 // claudeShellCount reads the count of running background shells from the Claude
@@ -324,17 +323,28 @@ func claudeShellCount(tool, socketName, tmuxName string) int {
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(pane, "\n") {
-		// The "N shells still running" spinner line is historical scrollback,
-		// not the live count — the live count lives on the ⏵⏵ status line.
-		if strings.Contains(line, "still running") {
+	return parseShellCountFromPane(pane)
+}
+
+// parseShellCountFromPane reads the shell count from ONLY the footer status line
+// — the last non-empty line of the captured pane. Scanning the whole pane would
+// false-match transcript text that happens to contain "· N shells" (a session
+// discussing shells, command output, or the agent's own quoted footer format).
+func parseShellCountFromPane(pane string) int {
+	lines := strings.Split(pane, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
 			continue
 		}
+		// First non-empty line from the bottom IS the footer. Parse it and stop
+		// — never fall through into the transcript above.
 		if m := shellCountRe.FindStringSubmatch(line); m != nil {
 			if n, err := strconv.Atoi(m[1]); err == nil {
 				return n
 			}
 		}
+		return 0
 	}
 	return 0
 }
