@@ -10,11 +10,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 type overlaySession struct {
@@ -27,6 +30,7 @@ type overlaySession struct {
 	OpenCmd    string `json:"open_command"`
 	IsActive   bool   `json:"is_active"`
 	NeedsInput bool   `json:"needs_input"`
+	ShellCount int    `json:"shell_count,omitempty"`
 }
 
 type overlayPayload struct {
@@ -218,6 +222,7 @@ func (o *overlayPusher) push(ctx context.Context) {
 			OpenCmd:    openCommand(s),
 			IsActive:   isActive,
 			NeedsInput: inputNeeded(s.ClaudeSessionID),
+			ShellCount: claudeShellCount(tool, s.TmuxSocketName, s.TmuxSession),
 		})
 	}
 	o.mu.Unlock()
@@ -301,6 +306,39 @@ func openCommand(s *MenuSession) string {
 // session. Claude's PreToolUse(AskUserQuestion) hook drops a marker file keyed
 // by Claude session_id; PostToolUse removes it. A stale guard ignores markers
 // older than 1h in case a clear was missed (session killed mid-question).
+// shellCountRe matches the running-shell segment of the Claude footer status
+// line, e.g. "· 2 shells ·" or "· 1 shell ·". The dot prefix keeps it off the
+// spinner line ("… · 2 shells still running"), which we also skip explicitly.
+var shellCountRe = regexp.MustCompile(`·\s*(\d+)\s+shells?\b`)
+
+// claudeShellCount reads the count of running background shells from the Claude
+// footer by capturing the session's pane. Returns 0 for non-Claude tools, when
+// there's no tmux session, on any capture error, or when the footer shows no
+// shell segment (0 shells).
+func claudeShellCount(tool, socketName, tmuxName string) int {
+	// `tool` is the mapped overlay name (mapToolName): Claude Code is "claude-code".
+	if tool != "claude-code" || tmuxName == "" {
+		return 0
+	}
+	pane, err := tmux.CaptureVisibleBySocket(socketName, tmuxName)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(pane, "\n") {
+		// The "N shells still running" spinner line is historical scrollback,
+		// not the live count — the live count lives on the ⏵⏵ status line.
+		if strings.Contains(line, "still running") {
+			continue
+		}
+		if m := shellCountRe.FindStringSubmatch(line); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 func inputNeeded(claudeSessionID string) bool {
 	if claudeSessionID == "" {
 		return false
@@ -330,7 +368,7 @@ func (o *overlayPusher) logDebug(sessions []overlaySession) {
 		if s.NeedsInput {
 			input = " INPUT-NEEDED"
 		}
-		fmt.Fprintf(f, "%s %-6s %-30s idle=%ds%s\n", ts, active, s.Summary, s.IdleSecs, input)
+		fmt.Fprintf(f, "%s %-6s %-30s idle=%ds sh=%d%s\n", ts, active, s.Summary, s.IdleSecs, s.ShellCount, input)
 	}
 	fmt.Fprintf(f, "%s --- pushed %d sessions ---\n", ts, len(sessions))
 }
