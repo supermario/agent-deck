@@ -251,6 +251,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/mobile/session/{id}/stream", s.handleMobileStream)
 	mux.HandleFunc("/api/mobile/session/{id}/terminal", s.handleMobileTerminal)
 	mux.HandleFunc("/api/mobile/session/{id}/voice", s.handleMobileVoice)
+	mux.HandleFunc("/api/mobile/session/{id}/voice/latest", s.handleMobileVoiceLatest)
 	mux.HandleFunc("/api/mobile/session/{id}/voice/audio", s.handleMobileVoiceAudio)
 	mux.HandleFunc("/api/mobile/session/{id}/send", s.handleMobileSend)
 

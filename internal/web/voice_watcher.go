@@ -11,8 +11,6 @@ package web
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"log/slog"
 	"os"
 	"strings"
@@ -77,8 +75,7 @@ func (s *Server) voiceWatchTick(seen map[string]string) {
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		sum := sha256.Sum256([]byte(se.ClaudeSessionID + ":" + text))
-		key := hex.EncodeToString(sum[:8])
+		key := voiceTurnKey(se.ClaudeSessionID, text)
 
 		prev, known := seen[se.ID]
 		if !known {
@@ -91,18 +88,20 @@ func (s *Server) voiceWatchTick(seen map[string]string) {
 			continue
 		}
 		seen[se.ID] = key
-		go s.deliverVoiceSummary(se.ID, se.Title, text)
+		go s.deliverVoiceSummary(se.ID, se.Title, text, key)
 	}
 }
 
-// deliverVoiceSummary generates the summary+audio for a completed turn and
-// pushes it. Runs in its own goroutine (generation takes seconds).
-func (s *Server) deliverVoiceSummary(sessionID, title, text string) {
+// deliverVoiceSummary generates the summary+audio for a completed turn, caches
+// it (so the phone can fetch it without regenerating), and pushes it. Runs in
+// its own goroutine (generation takes seconds).
+func (s *Server) deliverVoiceSummary(sessionID, title, text, turnKey string) {
 	gen, err := requestVoiceGeneration(text)
 	if err != nil {
 		voiceLog.Warn("voice_generate_failed", slog.String("session", sessionID), slog.String("error", err.Error()))
 		return
 	}
+	storeVoiceLatest(sessionID, gen.Summary, gen.AudioFile, turnKey)
 	cfg, err := loadAPNsConfig()
 	if err != nil {
 		voiceLog.Warn("voice_apns_config_failed", slog.String("error", err.Error()))

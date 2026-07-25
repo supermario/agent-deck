@@ -17,13 +17,20 @@ func TestSendVoicePush_Manual(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
+	envOr := func(k, d string) string {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+		return d
+	}
 	n, err := sendAPNsPush(cfg,
-		"atlas-heroku-aws",
-		"Test voice summary from agent-deck — if you see this, push + custom payload delivery works.",
+		envOr("PUSH_TITLE", "atlas-heroku-aws"),
+		envOr("PUSH_BODY", "Test voice summary from agent-deck."),
 		map[string]any{
 			"kind":       "voice_summary",
-			"session_id": "test-session",
-			"audio_file": "test.wav",
+			"session_id": envOr("PUSH_SESSION", "test-session"),
+			"audio_file": envOr("PUSH_AUDIO", "test.wav"),
+			"summary":    envOr("PUSH_BODY", "Test voice summary from agent-deck."),
 		})
 	t.Logf("sent to %d device(s), err=%v", n, err)
 	if err != nil {

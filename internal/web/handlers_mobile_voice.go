@@ -31,8 +31,8 @@ const voiceServerBase = "http://127.0.0.1:8123"
 var voiceHTTPClient = &http.Client{Timeout: 180 * time.Second}
 
 // voiceFileRe guards the proxied filename against path traversal: the voice
-// server names files <16-hex>.wav.
-var voiceFileRe = regexp.MustCompile(`^[A-Za-z0-9_-]+\.wav$`)
+// server names files <16-hex>.wav / .m4a.
+var voiceFileRe = regexp.MustCompile(`^[A-Za-z0-9_-]+\.(wav|m4a)$`)
 
 // ---- GET /api/mobile/session/{id}/voice ----
 
@@ -73,12 +73,67 @@ func (s *Server) handleMobileVoice(w http.ResponseWriter, r *http.Request) {
 		writeMobileError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// Cache it so a later /voice/latest (or the same turn via push) reuses it.
+	storeVoiceLatest(id, gen.Summary, gen.AudioFile, voiceTurnKey(inst.ClaudeSessionID, text))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"summary":   gen.Summary,
 		"voice":     gen.Voice,
 		"duration":  gen.Duration,
 		"audioFile": gen.AudioFile,
+	})
+}
+
+// ---- GET /api/mobile/session/{id}/voice/latest ----
+//
+// Returns the already-generated summary+audio for the session's CURRENT last
+// turn, if one is cached (from the turn-end watcher or a prior read) - no fresh
+// generation. The phone calls this on opening a session to preload the audio.
+
+func (s *Server) handleMobileVoiceLatest(w http.ResponseWriter, r *http.Request) {
+	if handledPreflight(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMobileError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := r.PathValue("id")
+	inst, err := s.loadMobileInstance(id)
+	if err != nil {
+		writeMobileError(w, http.StatusInternalServerError, "failed to load session")
+		return
+	}
+	if inst == nil {
+		writeMobileError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	inst.RefreshLiveSessionIDs()
+
+	unavailable := func() {
+		writeJSON(w, http.StatusOK, map[string]any{"available": false})
+	}
+
+	path := inst.GetJSONLPathForInstance()
+	if path == "" {
+		unavailable()
+		return
+	}
+	text := lastAssistantText(cachedTranscriptTurns(path))
+	if strings.TrimSpace(text) == "" {
+		unavailable()
+		return
+	}
+	entry, ok := getVoiceLatest(id)
+	if !ok || entry.TurnKey != voiceTurnKey(inst.ClaudeSessionID, text) {
+		// Nothing cached, or it's for a superseded turn.
+		unavailable()
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": true,
+		"summary":   entry.Summary,
+		"audioFile": entry.AudioFile,
 	})
 }
 
@@ -147,7 +202,11 @@ func (s *Server) handleMobileVoiceAudio(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	w.Header().Set("Content-Type", "audio/wav")
+	ctype := "audio/wav"
+	if strings.HasSuffix(f, ".m4a") {
+		ctype = "audio/mp4"
+	}
+	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Accept-Ranges", "bytes")
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
