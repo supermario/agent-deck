@@ -15,6 +15,7 @@ package web
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -67,19 +68,42 @@ func (s *Server) handleMobileVoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gen, err := requestVoiceGeneration(text)
+	if err != nil {
+		writeMobileError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"summary":   gen.Summary,
+		"voice":     gen.Voice,
+		"duration":  gen.Duration,
+		"audioFile": gen.AudioFile,
+	})
+}
+
+// voiceGenResult is what the voice server returns for one summary+TTS request.
+type voiceGenResult struct {
+	Summary   string
+	AudioFile string // bare "<key>.wav"; the phone/watcher build the audio URL
+	Duration  float64
+	Voice     string
+}
+
+// requestVoiceGeneration asks the local voice server to summarise text (OpenAI)
+// and synthesise it (OmniVoice), returning the summary + generated wav filename.
+// Shared by the on-demand endpoint and the turn-end watcher.
+func requestVoiceGeneration(text string) (*voiceGenResult, error) {
 	reqBody, _ := json.Marshal(map[string]string{"text": text})
 	resp, err := voiceHTTPClient.Post(voiceServerBase+"/api/session-voice", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-		writeMobileError(w, http.StatusBadGateway, "voice server unavailable: "+err.Error())
-		return
+		return nil, fmt.Errorf("voice server unavailable: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		writeMobileError(w, http.StatusBadGateway, "voice server error: "+strings.TrimSpace(string(body)))
-		return
+		return nil, fmt.Errorf("voice server error: %s", strings.TrimSpace(string(body)))
 	}
-
 	var vr struct {
 		Summary  string  `json:"summary"`
 		URL      string  `json:"url"` // /generated/<key>.wav
@@ -87,23 +111,13 @@ func (s *Server) handleMobileVoice(w http.ResponseWriter, r *http.Request) {
 		Voice    string  `json:"voice"`
 	}
 	if json.Unmarshal(body, &vr) != nil || vr.URL == "" {
-		writeMobileError(w, http.StatusBadGateway, "bad voice server response")
-		return
+		return nil, fmt.Errorf("bad voice server response")
 	}
-
-	// Derive the bare filename; the phone builds the audio URL against its own
-	// known base: /api/mobile/session/{id}/voice/audio?f=<file>.
 	file := vr.URL
 	if i := strings.LastIndex(file, "/"); i >= 0 {
 		file = file[i+1:]
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"summary":   vr.Summary,
-		"voice":     vr.Voice,
-		"duration":  vr.Duration,
-		"audioFile": file,
-	})
+	return &voiceGenResult{Summary: vr.Summary, AudioFile: file, Duration: vr.Duration, Voice: vr.Voice}, nil
 }
 
 // ---- GET /api/mobile/session/{id}/voice/audio?f=<key>.wav ----
