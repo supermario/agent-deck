@@ -386,6 +386,7 @@ func (s *Server) Start() error {
 	if s.overlay != nil {
 		s.overlay.startPeriodicPush(s.baseCtx, 5*time.Second)
 	}
+	s.startVoiceWatcher(s.baseCtx)
 	err := s.httpServer.ListenAndServe()
 	if s.hookWatcher != nil {
 		s.hookWatcher.Stop()
