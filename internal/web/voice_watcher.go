@@ -5,9 +5,10 @@ package web
 // OmniVoice) and sends an APNs push whose body is the summary and whose data
 // deep-links the phone to that session and auto-plays the pre-generated audio.
 //
-// Global for now ("across the board" testing). TODO: gate on the laptop being
-// clamshelled (dotfiles/scripts/clamstatus.sh) = on-the-go, so summaries are
-// only spoken when the user is actually away from the desk.
+// Gated on presence: proactive summaries+pushes only fire when the Mac is
+// "away" (screen locked or lid closed/clamshell). While unlocked at the desk we
+// suppress them - the user is right there. Set AGENTDECK_VOICE_IGNORE_LOCK=1 to
+// bypass the gate (e.g. testing a push while sitting at the desk).
 
 import (
 	"context"
@@ -96,6 +97,14 @@ func (s *Server) voiceWatchTick(seen map[string]string) {
 // it (so the phone can fetch it without regenerating), and pushes it. Runs in
 // its own goroutine (generation takes seconds).
 func (s *Server) deliverVoiceSummary(sessionID, title, text, turnKey string) {
+	if os.Getenv("AGENTDECK_VOICE_IGNORE_LOCK") != "1" {
+		if want, reason := machineWantsPush(); !want {
+			voiceLog.Info("voice_push_suppressed",
+				slog.String("session", sessionID),
+				slog.String("reason", reason))
+			return
+		}
+	}
 	gen, err := requestVoiceGeneration(text)
 	if err != nil {
 		voiceLog.Warn("voice_generate_failed", slog.String("session", sessionID), slog.String("error", err.Error()))
