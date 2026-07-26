@@ -122,6 +122,9 @@ func sendAPNsPush(c *apnsConfig, title, body string, data map[string]any) (int, 
 			"sound":              "default",
 			"interruption-level": "time-sensitive",
 			"category":           "VOICE_SUMMARY",
+			// Wake the app on receipt (when it's alive via keep-alive) so it can
+			// play the ducking attention tone, not just show the banner.
+			"content-available": 1,
 		},
 	}
 	for k, v := range data {
