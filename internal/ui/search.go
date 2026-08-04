@@ -89,10 +89,18 @@ func (s *Search) SetSize(width, height int) {
 	s.height = height
 }
 
-// Show makes the search overlay visible
+// Show makes the search overlay visible with a fresh, empty query.
+//
+// The input is cleared on every open so a stale query from a previous search
+// never carries over — matching GlobalSearch.Show(). updateResults() re-runs
+// against the empty query so the result list shows everything currently in
+// scope instead of the previous search's filtered remnants. Any group scope
+// set by openInGroupSearch is deliberately preserved (only Hide() clears it).
 func (s *Search) Show() {
 	s.visible = true
 	s.input.Focus()
+	s.input.SetValue("")
+	s.updateResults()
 	s.switchToGlobal = false
 }
 
