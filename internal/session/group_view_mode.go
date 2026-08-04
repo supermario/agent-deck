@@ -19,10 +19,15 @@ const (
 	// (with all their sessions, unsplit) and sinks empty groups below the
 	// divider.
 	GroupViewPopulatedTop
+	// GroupViewRecentFlat strips group headers and shows a flat list of every
+	// session ordered purely by last activity, most recent first. No divider
+	// and no active/idle split: a session must not jump position just because
+	// its status flipped while the user was reading the list.
+	GroupViewRecentFlat
 )
 
 // GroupViewModeCount is the number of cycle-able modes (used for "(mode+1)%N").
-const GroupViewModeCount = 3
+const GroupViewModeCount = 4
 
 // Label returns a short human-readable name for the mode (for status hints).
 func (m GroupViewMode) Label() string {
@@ -31,6 +36,8 @@ func (m GroupViewMode) Label() string {
 		return "Active on top"
 	case GroupViewPopulatedTop:
 		return "Populated on top"
+	case GroupViewRecentFlat:
+		return "By last active"
 	default:
 		return "Normal"
 	}
@@ -147,6 +154,10 @@ func hasMarkedAncestor(m map[string]bool, path string) bool {
 func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]GroupActivity) []Item {
 	if mode == GroupViewNormal {
 		return items
+	}
+
+	if mode == GroupViewRecentFlat {
+		return partitionRecentFlat(items)
 	}
 
 	// sessionGoesTop classifies a single session item.
@@ -327,4 +338,31 @@ func ensureBottomAncestorsPresent(bottom, source []Item) []Item {
 		out = append(out, it)
 	}
 	return out
+}
+
+// partitionRecentFlat strips group headers and returns a flat list of all
+// sessions. The caller is responsible for sorting by recency (the session
+// package lacks the hook-watcher context needed for accurate timestamps).
+func partitionRecentFlat(items []Item) []Item {
+	var sessions []Item
+	for _, it := range items {
+		if it.Type != ItemTypeSession || it.Session == nil {
+			continue
+		}
+		flat := it
+		flat.Level = 0
+		flat.Path = ""
+		flat.IsLastInGroup = false
+		flat.IsSubSession = false
+		flat.IsLastSubSession = false
+		flat.ParentIsLastInGroup = false
+		flat.RootGroupNum = 0
+		sessions = append(sessions, flat)
+	}
+
+	if len(sessions) == 0 {
+		return items
+	}
+
+	return sessions
 }

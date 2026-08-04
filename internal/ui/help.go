@@ -342,7 +342,7 @@ func (h *HelpOverlay) View() string {
 				{"/waiting", "Filter waiting"},
 				{"/running", "Filter running"},
 				{"/idle", "Filter idle"},
-				{groupViewKey, "Cycle view: active-on-top / populated-on-top"},
+				{groupViewKey, "Cycle view: active-on-top / populated-on-top / by last active"},
 			},
 		},
 		{

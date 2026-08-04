@@ -2517,6 +2517,17 @@ func (h *Home) rebuildFlatItemsPreservingSelection(identity selectedItemIdentity
 	h.syncViewport()
 }
 
+// refreshLastTurnTimestamps updates every session's cached last-turn
+// timestamp from its Claude transcript. Called before sorting in
+// GroupViewRecentFlat so recency order matches actual turn activity.
+func (h *Home) refreshLastTurnTimestamps() {
+	for _, g := range h.groupTree.Groups {
+		for _, s := range g.Sessions {
+			s.RefreshLastTurnAt()
+		}
+	}
+}
+
 // rebuildFlatItems rebuilds the flattened view from group tree
 func (h *Home) rebuildFlatItems() {
 	h.jumpMode = false
@@ -2619,6 +2630,19 @@ func (h *Home) rebuildFlatItems() {
 		// in the active view and sinks below the divider.
 		activity := h.groupTree.GroupActivityMap(viewArchived)
 		h.flatItems = session.PartitionByViewMode(h.flatItems, h.groupViewMode, activity)
+
+		// Recent-flat: order by real turn activity. Sorting lives here rather
+		// than in PartitionByViewMode because sessionSortTime needs the hook
+		// watcher, which is UI-layer state the session package cannot reach.
+		if h.groupViewMode == session.GroupViewRecentFlat {
+			sort.SliceStable(h.flatItems, func(i, j int) bool {
+				si, sj := h.flatItems[i].Session, h.flatItems[j].Session
+				if si == nil || sj == nil {
+					return si != nil
+				}
+				return h.sessionSortTime(si).After(h.sessionSortTime(sj))
+			})
+		}
 	}
 
 	// Recompute IsLastInGroup on the final visible list. GroupTree.Flatten sets
@@ -7149,6 +7173,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var remoteLatencyCmd tea.Cmd
 
 		if h.groupViewMode != session.GroupViewNormal {
+			if h.groupViewMode == session.GroupViewRecentFlat {
+				h.refreshLastTurnTimestamps()
+			}
 			selectedBefore := h.captureSelectedItemIdentity()
 			h.rebuildFlatItemsPreservingSelection(selectedBefore)
 		}
@@ -9721,10 +9748,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "t":
-		// Cycle list partition: normal → active-on-top → populated-on-top → normal.
+		// Cycle list partition: normal -> active-on-top -> populated-on-top -> by-last-active -> normal.
 		// Preserve the cursor's row identity across the rebuild.
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.groupViewMode = session.GroupViewMode((int(h.groupViewMode) + 1) % session.GroupViewModeCount)
+		if h.groupViewMode == session.GroupViewRecentFlat {
+			h.refreshLastTurnTimestamps()
+		}
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
 		h.skipDivider(1)
 		h.syncViewport()
@@ -19578,6 +19608,26 @@ func sessionActivityTime(createdAt, lastStartedAt, lastActivityAt, lastAccessedA
 		return lastAccessedAt
 	}
 	return ts
+}
+
+// sessionSortTime returns the best "last active" timestamp for recency
+// sorting. Prefers the transcript-derived last-turn time (the same signal the
+// overlay uses) when available, falling back to the badge formula.
+//
+// Deliberately pickBadgeTime and not sessionActivityTime: the latter layers in
+// LastAccessedAt, which only moves when you attach, so a session merely peeked
+// at yesterday would outrank one that did real work an hour ago. That is the
+// exact mis-ordering this view exists to avoid.
+func (h *Home) sessionSortTime(inst *session.Instance) time.Time {
+	if ts := inst.GetLastTurnAt(); !ts.IsZero() {
+		return ts
+	}
+	var hookStatus *session.HookStatus
+	if h.hookWatcher != nil {
+		hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
+	}
+	confirmedTs, confirmedObserved := inst.LastObservedActivity()
+	return pickBadgeTime(inst.CreatedAt, inst.LastStartedAt, hookStatus, inst.LastActivityAt(), confirmedTs, confirmedObserved)
 }
 
 // formatRelativeTime formats a time as a human-readable relative string using

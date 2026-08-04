@@ -1,6 +1,9 @@
 package session
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // helper: build a session item
 func sessItem(id string, status Status, path string) Item {
@@ -258,6 +261,16 @@ func TestPartitionActiveTopCollapsedRunningGroupStaysTop(t *testing.T) {
 	}
 }
 
+// sessItemAt builds a session item with a CreatedAt timestamp for recency sorting.
+func sessItemAt(id string, status Status, path string, created time.Time) Item {
+	return Item{
+		Type:    ItemTypeSession,
+		Session: &Instance{ID: id, Status: status, GroupPath: path, CreatedAt: created},
+		Path:    path,
+		Level:   1,
+	}
+}
+
 func TestPartitionActiveTopCollapsedIdleGroupSinks(t *testing.T) {
 	items := []Item{
 		groupItem("proj-a"), // expanded, running
@@ -276,5 +289,89 @@ func TestPartitionActiveTopCollapsedIdleGroupSinks(t *testing.T) {
 	}
 	if !eqSlice(got, want) {
 		t.Fatalf("collapsed idle group must sink:\n got=%v\nwant=%v", got, want)
+	}
+}
+
+func TestPartitionRecentFlatStripsGroupHeaders(t *testing.T) {
+	now := time.Now()
+	items := []Item{
+		groupItem("proj-a"),
+		sessItemAt("1", StatusRunning, "proj-a", now.Add(-1*time.Hour)),
+		sessItemAt("2", StatusIdle, "proj-a", now.Add(-2*time.Hour)),
+		groupItem("proj-b"),
+		sessItemAt("3", StatusIdle, "proj-b", now.Add(-3*time.Hour)),
+	}
+	got := summarize(PartitionByViewMode(items, GroupViewRecentFlat, nil))
+	for _, entry := range got {
+		if entry[:2] == "G:" {
+			t.Fatalf("recent-flat must strip group headers, got %v", got)
+		}
+	}
+}
+
+func TestPartitionRecentFlatKeepsAllSessions(t *testing.T) {
+	now := time.Now()
+	items := []Item{
+		groupItem("a"),
+		sessItemAt("s1", StatusIdle, "a", now),
+		sessItemAt("s2", StatusRunning, "a", now.Add(-5*time.Hour)),
+		groupItem("b"),
+		sessItemAt("s3", StatusIdle, "b", now.Add(-2*time.Hour)),
+	}
+	got := PartitionByViewMode(items, GroupViewRecentFlat, nil)
+	count := 0
+	for _, it := range got {
+		if it.Type == ItemTypeSession {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 sessions, got %d (items: %v)", count, summarize(got))
+	}
+}
+
+func TestPartitionRecentFlatNoDivider(t *testing.T) {
+	now := time.Now()
+	items := []Item{
+		groupItem("a"),
+		sessItemAt("1", StatusRunning, "a", now),
+		sessItemAt("2", StatusIdle, "a", now.Add(-1*time.Hour)),
+	}
+	got := summarize(PartitionByViewMode(items, GroupViewRecentFlat, nil))
+	for _, entry := range got {
+		if entry == "---" {
+			t.Fatalf("recent-flat must not have a divider, got %v", got)
+		}
+	}
+}
+
+func TestPartitionRecentFlatSetsLevelToZero(t *testing.T) {
+	now := time.Now()
+	items := []Item{
+		groupItem("a"),
+		sessItemAt("1", StatusRunning, "a", now),
+	}
+	items[1].Level = 2
+	got := PartitionByViewMode(items, GroupViewRecentFlat, nil)
+	for _, it := range got {
+		if it.Type == ItemTypeSession && it.Level != 0 {
+			t.Fatalf("recent-flat items must have Level=0, got Level=%d for %s", it.Level, it.Session.ID)
+		}
+	}
+}
+
+func TestPartitionRecentFlatClearsPath(t *testing.T) {
+	now := time.Now()
+	items := []Item{
+		groupItem("proj-a"),
+		sessItemAt("1", StatusIdle, "proj-a", now),
+		groupItem("proj-b"),
+		sessItemAt("2", StatusIdle, "proj-b", now.Add(-1*time.Hour)),
+	}
+	got := PartitionByViewMode(items, GroupViewRecentFlat, nil)
+	for _, it := range got {
+		if it.Type == ItemTypeSession && it.Path != "" {
+			t.Fatalf("recent-flat items must have empty Path, got %q for %s", it.Path, it.Session.ID)
+		}
 	}
 }

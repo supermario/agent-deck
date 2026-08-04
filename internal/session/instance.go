@@ -559,6 +559,8 @@ type Instance struct {
 	restartTmuxRecordErr    error
 	restartTmuxRecordStamps statedb.WriteStamps
 
+	lastTurnAt time.Time // Timestamp of the last user/assistant turn in the Claude transcript
+
 	// SSE-based status detection for OpenCode (set by OpenCodeSSEWatcher,
 	// issue #1614). Not persisted; rebuilt from the live event stream.
 	sseStatus     string    // "running" or "waiting" (empty = no SSE data)
@@ -1017,6 +1019,32 @@ func (inst *Instance) DisplayLastActivityTime() time.Time {
 		return inst.LastAccessedAt
 	}
 	return inst.CreatedAt
+}
+
+// GetLastTurnAt returns the cached last-turn timestamp from the Claude
+// transcript. Call RefreshLastTurnAt periodically to keep it current.
+func (inst *Instance) GetLastTurnAt() time.Time {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.lastTurnAt
+}
+
+// RefreshLastTurnAt reads the tail of this session's Claude transcript and
+// caches the timestamp of the last user/assistant turn. Mirrors the logic in
+// web/handlers_mobile.go lastTurnTimestamp but lives on Instance so the TUI
+// can use it for recency sorting without depending on the web package.
+func (inst *Instance) RefreshLastTurnAt() {
+	path := inst.GetJSONLPathForInstance()
+	if path == "" {
+		return
+	}
+	ts, ok := readLastTurnTimestamp(path)
+	if !ok {
+		return
+	}
+	inst.mu.Lock()
+	inst.lastTurnAt = ts
+	inst.mu.Unlock()
 }
 
 // LastObservedActivity returns the last time the tmux tracker confirmed a
