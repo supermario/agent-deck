@@ -252,8 +252,12 @@ func TestCycleGroupViewKeyTogglesMode(t *testing.T) {
 		t.Fatalf("after 2 presses expected PopulatedTop, got %v", home.groupViewMode)
 	}
 	press()
+	if home.groupViewMode != session.GroupViewRecentFlat {
+		t.Fatalf("after 3 presses expected RecentFlat, got %v", home.groupViewMode)
+	}
+	press()
 	if home.groupViewMode != session.GroupViewNormal {
-		t.Fatalf("after 3 presses expected Normal again, got %v", home.groupViewMode)
+		t.Fatalf("after 4 presses expected Normal again, got %v", home.groupViewMode)
 	}
 }
 
