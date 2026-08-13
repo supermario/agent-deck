@@ -213,25 +213,60 @@ func mobileSessionActivity(s *MenuSession, now time.Time) (idleSeconds, ttlSecon
 // existing match. Keying by sessionID - rather than globbing the cwd - is what
 // lets sessions sharing a working directory resolve to distinct files.
 func sessionTranscriptPath(cwd, claudeSessionID string) (string, bool) {
-	if cwd == "" || claudeSessionID == "" {
+	if claudeSessionID == "" {
 		return "", false
 	}
-	resolved := cwd
-	if r, err := filepath.EvalSymlinks(cwd); err == nil {
-		resolved = r
-	}
-	dirName := session.ConvertToClaudeDirName(resolved)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", false
 	}
+	configs := []string{".claude", ".claude-work"}
+	file := claudeSessionID + ".jsonl"
+
 	var newestPath string
 	var newestMod time.Time
-	for _, cfg := range []string{".claude", ".claude-work"} {
-		f := filepath.Join(home, cfg, "projects", dirName, claudeSessionID+".jsonl")
-		if fi, err := os.Stat(f); err == nil && (newestPath == "" || fi.ModTime().After(newestMod)) {
-			newestPath = f
+	consider := func(p string) {
+		if fi, err := os.Stat(p); err == nil && (newestPath == "" || fi.ModTime().After(newestMod)) {
+			newestPath = p
 			newestMod = fi.ModTime()
+		}
+	}
+
+	// Fast path: the directory named after the session's own cwd, correct for
+	// most sessions and a single stat each.
+	if cwd != "" {
+		resolved := cwd
+		if r, err := filepath.EvalSymlinks(cwd); err == nil {
+			resolved = r
+		}
+		dirName := session.ConvertToClaudeDirName(resolved)
+		for _, cfg := range configs {
+			consider(filepath.Join(home, cfg, "projects", dirName, file))
+		}
+		if newestPath != "" {
+			return newestPath, true
+		}
+	}
+
+	// Claude names that directory after the cwd the session was *started* in,
+	// which frequently isn't where agent-deck records it running. A resumed
+	// session keeps its original directory; a session started at a repo root
+	// keeps the root; a git worktree sits several levels below it. Those point
+	// in opposite directions, so there's no relationship to walk - look the file
+	// up by name instead. It's the session id, which is unique, so any hit is
+	// the right one no matter which cwd produced the directory.
+	//
+	// Worth getting right: on a miss the caller falls back to LastAccessedAt,
+	// which means "when the user last attached in the TUI". For a session driven
+	// from the phone and never opened there that's the zero time, and the
+	// session sorts to the very bottom of the list the moment it stops running.
+	for _, cfg := range configs {
+		matches, err := filepath.Glob(filepath.Join(home, cfg, "projects", "*", file))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			consider(m)
 		}
 	}
 	return newestPath, newestPath != ""
