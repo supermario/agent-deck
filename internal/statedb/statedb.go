@@ -1425,6 +1425,47 @@ func (s *StateDB) WriteClaudeSessionBinding(id, sessionID string, detectedAt tim
 	})
 }
 
+// ReleaseClaudeSessionBindingFromOthers clears $.claude_session_id on every
+// instance except keepID that currently claims sessionID, returning how many
+// rows it released.
+//
+// A Claude conversation belongs to exactly one instance at a time, but it can
+// move: start a conversation in one session, resume it in another, and both
+// rows end up pointing at the same id. Nothing released the old one, so the
+// stale instance kept mirroring the live conversation - the deck showed a dead
+// session (red, from its own long-gone tmux pane) reporting the live one's
+// idle time (from the shared transcript), and opening it in the mobile app
+// served the other session's history.
+//
+// Only the caller of bindClaudeSessionFromHook is in a position to know: a hook
+// payload correlated to an instance is verified ownership, so any other claimant
+// is by definition stale and safe to release. Deliberately clears rather than
+// deletes - the losing instance keeps its identity and history, it just stops
+// claiming a conversation that is no longer its own.
+func (s *StateDB) ReleaseClaudeSessionBindingFromOthers(keepID, sessionID string) (int64, error) {
+	if sessionID == "" {
+		return 0, nil
+	}
+	var released int64
+	err := withBusyRetry(func() error {
+		res, err := s.db.Exec(
+			`UPDATE instances
+			    SET tool_data = json_set(
+			          COALESCE(tool_data, '{}'),
+			          '$.claude_session_id', '')
+			  WHERE id != ?
+			    AND json_extract(tool_data, '$.claude_session_id') = ?`,
+			keepID, sessionID,
+		)
+		if err != nil {
+			return err
+		}
+		released, _ = res.RowsAffected()
+		return nil
+	})
+	return released, err
+}
+
 // WriteCodexSessionBinding is the Codex counterpart of
 // WriteClaudeSessionBinding: it atomically rewrites $.codex_session_id
 // and $.codex_detected_at inside the tool_data JSON column without

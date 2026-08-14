@@ -10678,6 +10678,27 @@ func (i *Instance) bindClaudeSessionFromHook(sessionID, hookSource, hookEvent, a
 				slog.String("new_id", sessionID),
 				slog.String("error", err.Error()))
 		}
+
+		// A conversation has one owner, and this hook payload just proved it is
+		// us. Any other instance still claiming it started or previously hosted
+		// the conversation and never let go - leave it bound and it goes on
+		// mirroring this session: same transcript in the mobile app, same idle
+		// time, while showing its own dead tmux pane's status. Release it.
+		if released, err := db.ReleaseClaudeSessionBindingFromOthers(i.ID, sessionID); err != nil {
+			sessionLog.Warn("claude_session_release_others_failed",
+				slog.String("instance_id", i.ID),
+				slog.String("session_id", sessionID),
+				slog.String("error", err.Error()))
+		} else if released > 0 {
+			sessionLog.Info("claude_session_released_from_others",
+				slog.String("instance_id", i.ID),
+				slog.String("session_id", sessionID),
+				slog.Int64("released", released))
+			_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
+				InstanceID: i.ID, Tool: i.Tool, Action: "release_others",
+				Source: hookSource, NewID: sessionID, HookEvent: hookEvent,
+			})
+		}
 	}
 }
 
