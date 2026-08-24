@@ -44,6 +44,9 @@ type mobileSession struct {
 	TTLSeconds  int  `json:"ttlSeconds"`
 	IsActive    bool `json:"isActive"`
 	NeedsInput  bool `json:"needsInput"`
+	// Global attention rank, 1 = highest. 0 means unranked and sorts last.
+	// Set by dragging the DotfilesBar overlay; the phone renders the same order.
+	Priority int `json:"priority"`
 }
 
 type mobileSessionsResponse struct {
@@ -137,6 +140,8 @@ func (s *Server) handleMobileSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	refreshSnapshotHookStatuses(snapshot, s.hookStatusLoader)
 
+	priorities := sessionPriorities()
+
 	now := time.Now()
 	out := mobileSessionsResponse{Sessions: []mobileSession{}}
 	for _, item := range snapshot.Items {
@@ -156,6 +161,7 @@ func (s *Server) handleMobileSessions(w http.ResponseWriter, r *http.Request) {
 			TTLSeconds:  ttl,
 			IsActive:    active,
 			NeedsInput:  needsInput,
+			Priority:    priorities[se.ID],
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -381,9 +387,9 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 	// written most recently — the reported co-located-session
 	// mixup. If this session has no resolvable transcript yet, an empty result
 	// is the honest answer, not a sibling's history.
-	path := inst.GetJSONLPathForInstance()
+	path := inst.GetTranscriptPathForInstance()
 	if path != "" {
-		all := cachedTranscriptTurns(path)
+		all := cachedTranscriptTurns(path, inst.Tool)
 		resp.Total = len(all)
 		if afterIndex > 0 {
 			if afterIndex <= len(all) {
@@ -414,24 +420,24 @@ var (
 	transcriptCache   = map[string]*transcriptCacheEntry{}
 )
 
-func cachedTranscriptTurns(path string) []mobileTurn {
+func cachedTranscriptTurns(path, tool string) []mobileTurn {
 	transcriptCacheMu.Lock()
 	defer transcriptCacheMu.Unlock()
 
 	fi, err := os.Stat(path)
 	if err != nil {
-		turns, _ := parseTranscriptFrom(path, 0)
+		turns, _ := parseTranscriptFrom(path, 0, tool)
 		return turns
 	}
 
 	entry := transcriptCache[path]
 	if entry == nil || fi.Size() < entry.offset {
-		turns, off := parseTranscriptFrom(path, 0)
+		turns, off := parseTranscriptFrom(path, 0, tool)
 		transcriptCache[path] = &transcriptCacheEntry{offset: off, turns: turns}
 		return turns
 	}
 	if fi.Size() > entry.offset {
-		newTurns, off := parseTranscriptFrom(path, entry.offset)
+		newTurns, off := parseTranscriptFrom(path, entry.offset, tool)
 		if len(newTurns) > 0 {
 			entry.turns = append(entry.turns, newTurns...)
 		}
@@ -440,12 +446,12 @@ func cachedTranscriptTurns(path string) []mobileTurn {
 	return entry.turns
 }
 
-// parseTranscriptFrom reads a Claude JSONL transcript starting at byte offset
+// parseTranscriptFrom reads a native agent transcript starting at byte offset
 // start, flattening genuine user/assistant records into chat turns. It only
 // consumes complete lines (ending in '\n'); the returned offset is the position
 // after the last complete line, so a partially-written trailing record is
 // re-read next time rather than parsed truncated.
-func parseTranscriptFrom(path string, start int64) ([]mobileTurn, int64) {
+func parseTranscriptFrom(path string, start int64, tool string) ([]mobileTurn, int64) {
 	turns := []mobileTurn{}
 
 	f, err := os.Open(path)
@@ -467,7 +473,7 @@ func parseTranscriptFrom(path string, start int64) ([]mobileTurn, int64) {
 		if err == nil {
 			// Complete line (delimiter included).
 			offset += int64(len(line))
-			if turn, ok := parseTurnLine(line); ok {
+			if turn, ok := parseTurnLineForTool(line, tool); ok {
 				turns = append(turns, turn)
 			}
 			continue
@@ -477,6 +483,63 @@ func parseTranscriptFrom(path string, start int64) ([]mobileTurn, int64) {
 		break
 	}
 	return turns, offset
+}
+
+func parseTurnLineForTool(line []byte, tool string) (mobileTurn, bool) {
+	if session.IsCodexCompatible(tool) {
+		return parseCodexTurnLine(line)
+	}
+	return parseTurnLine(line)
+}
+
+// parseCodexTurnLine converts a Codex rollout response_item message into the
+// same small turn schema used by the BentoLife client. Developer/system
+// messages are deliberately excluded: they are runtime instructions, not
+// conversation the user sent or received.
+func parseCodexTurnLine(line []byte) (mobileTurn, bool) {
+	var record struct {
+		Type      string `json:"type"`
+		Timestamp string `json:"timestamp"`
+		Payload   struct {
+			Type    string          `json:"type"`
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(line, &record); err != nil || record.Type != "response_item" || record.Payload.Type != "message" {
+		return mobileTurn{}, false
+	}
+	if record.Payload.Role != "user" && record.Payload.Role != "assistant" {
+		return mobileTurn{}, false
+	}
+
+	var text string
+	if err := json.Unmarshal(record.Payload.Content, &text); err != nil {
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(record.Payload.Content, &blocks); err != nil {
+			return mobileTurn{}, false
+		}
+		var out strings.Builder
+		for _, block := range blocks {
+			if block.Type == "input_text" || block.Type == "output_text" || block.Type == "text" {
+				out.WriteString(block.Text)
+			}
+		}
+		text = out.String()
+	}
+	if strings.TrimSpace(text) == "" {
+		return mobileTurn{}, false
+	}
+	return mobileTurn{
+		Role:  record.Payload.Role,
+		Text:  text,
+		TS:    record.Timestamp,
+		TsMs:  parseTsMs(record.Timestamp),
+		Tools: []mobileToolRef{},
+	}, true
 }
 
 // parseTurnLine parses one JSONL record into a chat turn. ok is false for
@@ -609,8 +672,8 @@ func extractUserText(content json.RawMessage) string {
 func isNoiseUserText(text string) bool {
 	t := strings.TrimSpace(text)
 	prefixes := []string{
-		"<command-",         // slash-command wrappers: <command-name>, <command-message>, <command-args>
-		"<local-command-",   // local-command plumbing: -stdout, -stderr, -caveat
+		"<command-",       // slash-command wrappers: <command-name>, <command-message>, <command-args>
+		"<local-command-", // local-command plumbing: -stdout, -stderr, -caveat
 		"<system-reminder>",
 		"<task-notification>", // background-agent completion notices injected as a user turn
 		"Caveat: The messages below were generated by the user",

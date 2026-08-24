@@ -263,6 +263,7 @@ func NewServer(cfg Config) *Server {
 	// ctrl+z undo). Register before the subtree pattern so Go 1.22+
 	// ServeMux precedence routes it cleanly instead of treating
 	// "undelete" as a sessionID.
+	mux.HandleFunc("/api/sessions/priority", s.handleSessionPriority)
 	mux.HandleFunc("POST /api/sessions/undelete", s.handleSessionUndelete)
 	mux.HandleFunc("/api/sessions/archived", s.handleArchivedSessions)
 	mux.HandleFunc("/api/sessions/", s.handleSessionByAction)

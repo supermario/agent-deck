@@ -7671,6 +7671,20 @@ func (i *Instance) GetJSONLPathForInstance() string {
 	return resolveClaudeTranscriptPath(GetClaudeConfigDirForInstance(i), i.ProjectPath, i.ClaudeSessionID)
 }
 
+// GetTranscriptPathForInstance resolves this instance's native transcript.
+// Claude stores conversations beneath its config directory, while Codex stores
+// rollout JSONL files beneath CODEX_HOME/sessions. Callers that render a
+// conversation should use this rather than the Claude-named helper above.
+func (i *Instance) GetTranscriptPathForInstance() string {
+	if IsClaudeCompatible(i.Tool) {
+		return i.GetJSONLPathForInstance()
+	}
+	if IsCodexCompatible(i.Tool) {
+		return codexRolloutPathInHome(i.CodexSessionID, i.getCodexHomeDir())
+	}
+	return ""
+}
+
 // getClaudeLastResponse extracts the last assistant message from Claude's JSONL file
 func (i *Instance) getClaudeLastResponse() (*ResponseOutput, error) {
 	// Require stored session ID - no fallback to file scanning
@@ -10340,6 +10354,16 @@ func (i *Instance) RefreshLiveSessionIDs() {
 	}
 	if i.Tool == "gemini" {
 		i.syncGeminiSessionFromTmux()
+	}
+	if IsCodexCompatible(i.Tool) {
+		// Codex publishes its active thread UUID through the tmux environment.
+		// Mobile/API callers load a fresh instance from SQLite for every request,
+		// so refresh it here just as we do for Claude; otherwise a live Codex
+		// session whose ID has not yet been persisted looks transcript-less.
+		if id, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" && id != i.CodexSessionID {
+			i.CodexSessionID = id
+			i.CodexDetectedAt = time.Now()
+		}
 	}
 }
 

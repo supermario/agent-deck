@@ -629,6 +629,15 @@ func (s *StateDB) Migrate() error {
 		// deliberate-idle (never a self-heal candidate). Additive + targeted-write
 		// only (WriteLastSentAt); never part of a whole-row REPLACE/SaveInstances.
 		"ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0",
+		// v14 (session priority): a GLOBAL attention rank, distinct from
+		// sort_order, which is position *within a group* and belongs to the TUI's
+		// group reorder. Priority is cross-group: it answers "what should I look
+		// at next" across the whole deck, which is what the overlay's drag order
+		// and the next-session hotkey read. 0 means "unranked" and sorts after
+		// everything ranked, so legacy rows stay out of the way until dragged.
+		// Additive + targeted-write only (WriteSessionPriorities); never part of
+		// a whole-row REPLACE/SaveInstances.
+		"ALTER TABLE instances ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -793,7 +802,13 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 		autoNameInt = 1
 	}
 	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO instances (
+		-- Upsert, NOT INSERT OR REPLACE. REPLACE deletes the row and inserts a
+		-- fresh one, which resets every column absent from this list to its
+		-- default. Columns written by targeted single-column UPDATEs live
+		-- outside this list on purpose (priority, last_sent_at), and REPLACE
+		-- silently wiped them on every ordinary save — a new session or a status
+		-- change was enough to erase a user's whole manual ordering.
+		INSERT INTO instances (
 			id, title, project_path, group_path, sort_order,
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
@@ -801,6 +816,32 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 			worktree_path, worktree_repo, worktree_branch, account,
 			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+				title = excluded.title,
+				project_path = excluded.project_path,
+				group_path = excluded.group_path,
+				sort_order = excluded.sort_order,
+				command = excluded.command,
+				wrapper = excluded.wrapper,
+				tool = excluded.tool,
+				status = excluded.status,
+				tmux_session = excluded.tmux_session,
+				tmux_socket_name = excluded.tmux_socket_name,
+				created_at = excluded.created_at,
+				last_accessed = excluded.last_accessed,
+				parent_session_id = excluded.parent_session_id,
+				is_conductor = excluded.is_conductor,
+				no_transition_notify = excluded.no_transition_notify,
+				worktree_path = excluded.worktree_path,
+				worktree_repo = excluded.worktree_repo,
+				worktree_branch = excluded.worktree_branch,
+				account = excluded.account,
+				archived_at = excluded.archived_at,
+				tool_data = excluded.tool_data,
+				title_locked = excluded.title_locked,
+				auto_name = excluded.auto_name,
+				auto_name_description = excluded.auto_name_description,
+				pin = excluded.pin
 	`,
 		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
 		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
@@ -968,7 +1009,13 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO instances (
+		-- Upsert, NOT INSERT OR REPLACE. REPLACE deletes the row and inserts a
+		-- fresh one, which resets every column absent from this list to its
+		-- default. Columns written by targeted single-column UPDATEs live
+		-- outside this list on purpose (priority, last_sent_at), and REPLACE
+		-- silently wiped them on every ordinary save — a new session or a status
+		-- change was enough to erase a user's whole manual ordering.
+		INSERT INTO instances (
 			id, title, project_path, group_path, sort_order,
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
@@ -976,6 +1023,32 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
 			worktree_path, worktree_repo, worktree_branch, account,
 			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+				title = excluded.title,
+				project_path = excluded.project_path,
+				group_path = excluded.group_path,
+				sort_order = excluded.sort_order,
+				command = excluded.command,
+				wrapper = excluded.wrapper,
+				tool = excluded.tool,
+				status = excluded.status,
+				tmux_session = excluded.tmux_session,
+				tmux_socket_name = excluded.tmux_socket_name,
+				created_at = excluded.created_at,
+				last_accessed = excluded.last_accessed,
+				parent_session_id = excluded.parent_session_id,
+				is_conductor = excluded.is_conductor,
+				no_transition_notify = excluded.no_transition_notify,
+				worktree_path = excluded.worktree_path,
+				worktree_repo = excluded.worktree_repo,
+				worktree_branch = excluded.worktree_branch,
+				account = excluded.account,
+				archived_at = excluded.archived_at,
+				tool_data = excluded.tool_data,
+				title_locked = excluded.title_locked,
+				auto_name = excluded.auto_name,
+				auto_name_description = excluded.auto_name_description,
+				pin = excluded.pin
 	`)
 	if err != nil {
 		return err
@@ -1421,6 +1494,120 @@ func (s *StateDB) WriteClaudeSessionBinding(id, sessionID string, detectedAt tim
 			 WHERE id = ?`,
 			sessionID, detectedAt.Unix(), id,
 		)
+		return err
+	})
+}
+
+// ReadSessionPriorities returns the global attention rank for every ranked
+// instance, keyed by instance id. Unranked rows (priority 0) are omitted.
+func (s *StateDB) ReadSessionPriorities() (map[string]int, error) {
+	out := map[string]int{}
+	rows, err := s.db.Query(`SELECT id, priority FROM instances WHERE priority > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id string
+		var p int
+		if err := rows.Scan(&id, &p); err != nil {
+			return nil, err
+		}
+		out[id] = p
+	}
+	return out, rows.Err()
+}
+
+// WriteSessionPriorities assigns rank 1..N to ids in the order given, and moves
+// any other ranked session below them, keeping its relative order.
+//
+// Takes the whole ordering rather than a single (id, rank) pair because that is
+// what a drag-and-drop produces: sending it as one transaction means there is
+// never a moment where two sessions share a rank or a rank goes missing.
+//
+// Crucially it does NOT clear the sessions it wasn't told about. The overlay
+// only shows a working subset — around a dozen of many dozens — so a caller can
+// only ever submit what it can see. Clearing the rest meant a session that
+// scrolled out of the overlay's retention window silently lost its rank, and
+// any new session appearing was enough to evict one and wipe it. Ranking is
+// therefore additive: you order what's in front of you, and everything already
+// ranked keeps its relative order underneath.
+//
+// Targeted UPDATE of one column: a whole-row write would race SaveInstance from
+// a peer process holding a stale snapshot (see WriteClaudeSessionBinding).
+func (s *StateDB) WriteSessionPriorities(orderedIDs []string) error {
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		submitted := make(map[string]bool, len(orderedIDs))
+		for _, id := range orderedIDs {
+			if id != "" {
+				submitted[id] = true
+			}
+		}
+
+		// Everything currently ranked but not in this submission, oldest rank
+		// first, so their relative order survives being pushed down.
+		rows, err := tx.Query(`SELECT id FROM instances WHERE priority > 0 ORDER BY priority ASC`)
+		if err != nil {
+			return err
+		}
+		var carried []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if !submitted[id] {
+				carried = append(carried, id)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		_ = rows.Close()
+
+		if _, err := tx.Exec(`UPDATE instances SET priority = 0 WHERE priority != 0`); err != nil {
+			return err
+		}
+		stmt, err := tx.Prepare(`UPDATE instances SET priority = ? WHERE id = ?`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stmt.Close() }()
+
+		rank := 0
+		for _, id := range orderedIDs {
+			if id == "" {
+				continue
+			}
+			rank++
+			if _, err := stmt.Exec(rank, id); err != nil {
+				return err
+			}
+		}
+		for _, id := range carried {
+			rank++
+			if _, err := stmt.Exec(rank, id); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+}
+
+// ClearSessionPriorities drops every rank. Separate from WriteSessionPriorities
+// because that one deliberately preserves ranks it wasn't told about, so it can
+// no longer express "clear everything".
+func (s *StateDB) ClearSessionPriorities() error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(`UPDATE instances SET priority = 0 WHERE priority != 0`)
 		return err
 	})
 }

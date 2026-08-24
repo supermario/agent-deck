@@ -31,6 +31,13 @@ type overlaySession struct {
 	IsActive   bool   `json:"is_active"`
 	NeedsInput bool   `json:"needs_input"`
 	ShellCount int    `json:"shell_count,omitempty"`
+	AgentCount int    `json:"agent_count,omitempty"`
+	// Global attention rank, 1 = highest, 0 = unranked. Drives both the
+	// overlay's display order and the next-session hotkey's pick order.
+	Priority int `json:"priority,omitempty"`
+	// GitHub PRs mentioned in this session's transcript, first-seen order.
+	// Rendered as clickable #NNNN chips so a session links back to its PRs.
+	PRs []prRef `json:"prs,omitempty"`
 }
 
 type overlayPayload struct {
@@ -39,8 +46,9 @@ type overlayPayload struct {
 	Usage    map[string]usageOut `json:"usage"`
 }
 
-// usageFile mirrors the JSON the Claude statusline writes per account to
-// /tmp/claude-usage-<account>.json.
+// usageFile is the normalised JSON written by the Claude and Codex usage
+// pollers. Both providers expose rolling quota windows, so the overlay does not
+// need to know which account API produced a row.
 type usageWindow struct {
 	UsedPercentage float64 `json:"used_percentage"`
 	ResetsAt       int64   `json:"resets_at"`
@@ -62,13 +70,22 @@ type usageOut struct {
 	CapturedAt       int64    `json:"captured_at"`
 }
 
-// readUsage loads the per-account usage files written by the statusline.
+var overlayUsageDir = "/tmp"
+
+// readUsage loads the per-account usage files written by the local pollers.
 // Accounts whose data is missing or older than 6h are omitted.
 func readUsage() map[string]usageOut {
 	out := map[string]usageOut{}
 	now := time.Now().Unix()
-	for _, acct := range []string{"personal", "work"} {
-		data, err := os.ReadFile("/tmp/claude-usage-" + acct + ".json")
+	for _, source := range []struct {
+		account  string
+		filename string
+	}{
+		{account: "personal", filename: "claude-usage-personal.json"},
+		{account: "work", filename: "claude-usage-work.json"},
+		{account: "codex", filename: "codex-usage.json"},
+	} {
+		data, err := os.ReadFile(filepath.Join(overlayUsageDir, source.filename))
 		if err != nil {
 			continue
 		}
@@ -90,7 +107,7 @@ func readUsage() map[string]usageOut {
 			o.FiveHourPct = &pct
 			o.FiveHourResetsAt = &reset
 		}
-		out[acct] = o
+		out[source.account] = o
 	}
 	// Always return a non-nil map so the client can clear stale usage
 	// (the field is always present on the agent-deck push).
@@ -105,6 +122,9 @@ type overlayPusher struct {
 	lastHash   [32]byte
 	lastStatus map[string]bool
 	idleSince  map[string]time.Time
+	// Incremental PR-scan position per session. Guarded by mu, like the maps
+	// above: push() holds it across the whole scan loop.
+	prCache map[string]*prScanState
 }
 
 func newOverlayPusher(menuData MenuDataLoader) *overlayPusher {
@@ -125,6 +145,8 @@ func (o *overlayPusher) push(ctx context.Context) {
 		overlayLog.Debug("overlay_snapshot_failed", slog.String("error", err.Error()))
 		return
 	}
+
+	priorities := sessionPriorities()
 
 	now := time.Now()
 	var sessions []overlaySession
@@ -162,9 +184,15 @@ func (o *overlayPusher) push(ctx context.Context) {
 		// mtime gets bumped by session-resume/housekeeping without a new turn,
 		// which made idle sessions look recently active (see handlers_mobile.go).
 		var lastTurn time.Time
+		var prs []prRef
 		if path, ok := sessionTranscriptPath(s.ProjectPath, s.ClaudeSessionID); ok {
 			if ts, ok2 := lastTurnTimestamp(path); ok2 {
 				lastTurn = ts
+			}
+			// Same transcript, scanned incrementally - see scanPRs. Excluded
+			// sessions are skipped before the scan, so they cost no file I/O.
+			if !prSessionExcluded(s.Title) {
+				prs = o.scanPRs(s.ID, path)
 			}
 		}
 
@@ -212,7 +240,11 @@ func (o *overlayPusher) push(ctx context.Context) {
 			continue
 		}
 
+		shellCount, agentCount := claudePaneCounts(tool, s.TmuxSocketName, s.TmuxSession)
+
 		sessions = append(sessions, overlaySession{
+			Priority:   priorities[s.ID],
+			PRs:        prs,
 			SessionID:  s.ID,
 			Tool:       tool,
 			CWD:        s.ProjectPath,
@@ -222,7 +254,8 @@ func (o *overlayPusher) push(ctx context.Context) {
 			OpenCmd:    openCommand(s),
 			IsActive:   isActive,
 			NeedsInput: inputNeeded(s.ClaudeSessionID),
-			ShellCount: claudeShellCount(tool, s.TmuxSocketName, s.TmuxSession),
+			ShellCount: shellCount,
+			AgentCount: agentCount,
 		})
 	}
 	o.mu.Unlock()
@@ -310,35 +343,56 @@ func openCommand(s *MenuSession) string {
 // line, e.g. "· 2 shells ·" or "· 1 shell ·".
 var shellCountRe = regexp.MustCompile(`·\s*(\d+)\s+shells?\b`)
 
-// claudeShellCount reads the count of running background shells from the Claude
-// footer by capturing the session's pane. Returns 0 for non-Claude tools, when
-// there's no tmux session, on any capture error, or when the footer shows no
-// shell segment (0 shells).
-func claudeShellCount(tool, socketName, tmuxName string) int {
+// Claude renders a thread roster underneath the footer whenever subagents are
+// live: one "⏺ main" row for the main thread, then one row per agent, e.g.
+//
+//	⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+//	⏺ main
+//	◯ general-purpose  Verifying IOG cache narinfo hits   36m 53s · ↓ 177.2k tokens
+//
+// The bullets are distinct codepoints — U+23FA for main, U+25EF for an agent —
+// which is what makes this safe to match on.
+var (
+	agentRowRe = regexp.MustCompile(`^◯\s+\S`)
+	mainRowRe  = regexp.MustCompile(`^⏺\s+main\b`)
+)
+
+// claudePaneCounts reads the running background shells and running subagents for
+// a session from one pane capture. Returns zeroes for non-Claude tools, when
+// there's no tmux session, or on any capture error.
+//
+// Both come from the same capture deliberately: this runs per session on every
+// overlay push, and a second capture would double the tmux round-trips for a
+// number we already have on screen.
+func claudePaneCounts(tool, socketName, tmuxName string) (shells, agents int) {
 	// `tool` is the mapped overlay name (mapToolName): Claude Code is "claude-code".
 	if tool != "claude-code" || tmuxName == "" {
-		return 0
+		return 0, 0
 	}
 	pane, err := tmux.CaptureVisibleBySocket(socketName, tmuxName)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
-	return parseShellCountFromPane(pane)
+	return parseShellCountFromPane(pane), parseAgentCountFromPane(pane)
 }
 
-// parseShellCountFromPane reads the shell count from ONLY the footer status line
-// — the last non-empty line of the captured pane. Scanning the whole pane would
-// false-match transcript text that happens to contain "· N shells" (a session
-// discussing shells, command output, or the agent's own quoted footer format).
+// parseShellCountFromPane reads the shell count from ONLY the footer status line.
+// Scanning the whole pane would false-match transcript text that happens to
+// contain "· N shells" (a session discussing shells, command output, or the
+// agent's own quoted footer format).
+//
+// The footer is the last non-empty line EXCEPT when subagents are running, which
+// pushes a thread roster below it. Skipping those rows is what keeps the shell
+// badge working on a session that has both shells and agents.
 func parseShellCountFromPane(pane string) int {
 	lines := strings.Split(pane, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
-		if line == "" {
+		if line == "" || agentRowRe.MatchString(line) || mainRowRe.MatchString(line) {
 			continue
 		}
-		// First non-empty line from the bottom IS the footer. Parse it and stop
-		// — never fall through into the transcript above.
+		// First non-roster, non-empty line from the bottom IS the footer. Parse
+		// it and stop — never fall through into the transcript above.
 		if m := shellCountRe.FindStringSubmatch(line); m != nil {
 			if n, err := strconv.Atoi(m[1]); err == nil {
 				return n
@@ -347,6 +401,34 @@ func parseShellCountFromPane(pane string) int {
 		return 0
 	}
 	return 0
+}
+
+// parseAgentCountFromPane counts the running subagents in the roster block at
+// the very bottom of the pane.
+//
+// Bounded the same way the shell parse is: walk up from the last line and stop
+// at the first line that is not part of the roster, so transcript text can never
+// leak in — a session whose conversation happens to quote a roster row is only a
+// match if that text is the last thing on screen, which the footer prevents.
+func parseAgentCountFromPane(pane string) int {
+	lines := strings.Split(pane, "\n")
+	count := 0
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		switch {
+		case line == "":
+			continue
+		case agentRowRe.MatchString(line):
+			count++
+		case mainRowRe.MatchString(line):
+			// The main thread is not an agent, but it is part of the roster, so
+			// keep walking past it.
+			continue
+		default:
+			return count
+		}
+	}
+	return count
 }
 
 func inputNeeded(claudeSessionID string) bool {
@@ -378,7 +460,16 @@ func (o *overlayPusher) logDebug(sessions []overlaySession) {
 		if s.NeedsInput {
 			input = " INPUT-NEEDED"
 		}
-		fmt.Fprintf(f, "%s %-6s %-30s idle=%ds sh=%d%s\n", ts, active, s.Summary, s.IdleSecs, s.ShellCount, input)
+		prs := ""
+		if len(s.PRs) > 0 {
+			nums := make([]string, 0, len(s.PRs))
+			for _, p := range s.PRs {
+				nums = append(nums, "#"+strconv.Itoa(p.Number))
+			}
+			prs = " prs=" + strings.Join(nums, ",")
+		}
+		fmt.Fprintf(f, "%s %-6s %-30s idle=%ds sh=%d ag=%d pri=%d%s%s\n",
+			ts, active, s.Summary, s.IdleSecs, s.ShellCount, s.AgentCount, s.Priority, input, prs)
 	}
 	fmt.Fprintf(f, "%s --- pushed %d sessions ---\n", ts, len(sessions))
 }
@@ -425,4 +516,3 @@ func StartOverlayPusher(ctx context.Context, profile string) {
 	pusher := newOverlayPusher(menuData)
 	pusher.startPeriodicPush(ctx, 5*time.Second)
 }
-
