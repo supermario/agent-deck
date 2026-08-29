@@ -121,6 +121,15 @@ func (s *Server) handleMobileStream(w http.ResponseWriter, r *http.Request) {
 
 	lw := &wsLineWriter{conn: conn}
 
+	// Codex rollout files do not use Claude's StreamEvent schema. Poll their
+	// native transcript for completed turns and send a lightweight stop event;
+	// BentoLife then performs its normal incremental REST fetch. This keeps the
+	// app protocol uniform without pretending Codex records are Claude events.
+	if session.IsCodexCompatible(inst.Tool) {
+		streamCodexTranscript(ctx, conn, inst)
+		return
+	}
+
 	// Live tail across turns: StreamTranscript returns at each end_turn; we
 	// restart it (streaming only records newer than "now") to pick up the next
 	// turn, until the client disconnects. IdleTimeout is set very high so quiet
@@ -130,7 +139,7 @@ func (s *Server) handleMobileStream(w http.ResponseWriter, r *http.Request) {
 		inst.RefreshLiveSessionIDs()
 		// Strict per-session resolution — see handleMobileTranscript: never fall
 		// back to newest-in-cwd, which streams a co-located sibling's turns.
-		path := inst.GetJSONLPathForInstance()
+		path := inst.GetTranscriptPathForInstance()
 		if path == "" {
 			if sleepCtx(ctx, 500*time.Millisecond) {
 				return
@@ -146,6 +155,30 @@ func (s *Server) handleMobileStream(w http.ResponseWriter, r *http.Request) {
 		// end_turn / timeout: brief pause, then resume tailing for the next turn.
 		if sleepCtx(ctx, 250*time.Millisecond) {
 			return
+		}
+	}
+}
+
+func streamCodexTranscript(ctx context.Context, conn *websocket.Conn, inst *session.Instance) {
+	lastTotal := -1
+	ticker := time.NewTicker(750 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		inst.RefreshLiveSessionIDs()
+		path := inst.GetTranscriptPathForInstance()
+		if path != "" {
+			total := len(cachedTranscriptTurns(path, inst.Tool))
+			if lastTotal >= 0 && total != lastTotal {
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"stop"}`)); err != nil {
+					return
+				}
+			}
+			lastTotal = total
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }

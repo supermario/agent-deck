@@ -72,7 +72,7 @@ func (s *Server) voiceWatchTick(seen map[string]string) {
 		if !ok {
 			continue
 		}
-		text := lastAssistantText(cachedTranscriptTurns(path))
+		text := lastAssistantText(cachedTranscriptTurns(path, se.Tool))
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
