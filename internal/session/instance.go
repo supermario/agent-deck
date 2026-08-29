@@ -1029,6 +1029,19 @@ func (inst *Instance) GetLastTurnAt() time.Time {
 	return inst.lastTurnAt
 }
 
+// SetLastTurnAt seeds the cached last-turn timestamp without re-reading the
+// transcript. Used to carry the cache across a storage reload, which replaces
+// every Instance with a freshly-loaded one: the field is in-memory only, so
+// without this the recency sort silently loses its key on every reload.
+func (inst *Instance) SetLastTurnAt(ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+	inst.mu.Lock()
+	inst.lastTurnAt = ts
+	inst.mu.Unlock()
+}
+
 // RefreshLastTurnAt reads the tail of this session's Claude transcript and
 // caches the timestamp of the last user/assistant turn. Mirrors the logic in
 // web/handlers_mobile.go lastTurnTimestamp but lives on Instance so the TUI

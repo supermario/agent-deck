@@ -2528,6 +2528,43 @@ func (h *Home) refreshLastTurnTimestamps() {
 	}
 }
 
+// carryLastTurnAt copies the cached transcript last-turn timestamps from the
+// outgoing instances onto the freshly-loaded ones, matched by session ID.
+//
+// Instance.lastTurnAt is an in-memory cache that is never persisted, so a
+// storage reload (which replaces every *Instance wholesale) resets it to zero
+// for the whole fleet. GroupViewRecentFlat sorts on it and falls back to the
+// badge formula when it is zero, so without this the entire list re-orders to a
+// different sort key the instant a reload lands, then snaps back on the next
+// 2s tick when refreshLastTurnTimestamps repopulates it. Re-reading every
+// transcript on reload would fix it too, but costs a 1MB tail read per session;
+// the cached values are still valid, so carry them.
+func carryLastTurnAt(prev, next []*session.Instance) {
+	if len(prev) == 0 || len(next) == 0 {
+		return
+	}
+	cached := make(map[string]time.Time, len(prev))
+	for _, inst := range prev {
+		if inst == nil {
+			continue
+		}
+		if ts := inst.GetLastTurnAt(); !ts.IsZero() {
+			cached[inst.ID] = ts
+		}
+	}
+	if len(cached) == 0 {
+		return
+	}
+	for _, inst := range next {
+		if inst == nil {
+			continue
+		}
+		if ts, ok := cached[inst.ID]; ok {
+			inst.SetLastTurnAt(ts)
+		}
+	}
+}
+
 // rebuildFlatItems rebuilds the flattened view from group tree
 func (h *Home) rebuildFlatItems() {
 	h.jumpMode = false
@@ -5673,6 +5710,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			h.instancesMu.Lock()
 			oldCount := len(h.instances)
+			// Preserve the recency sort key across the swap (see carryLastTurnAt).
+			carryLastTurnAt(h.instances, msg.instances)
 			h.instances = msg.instances
 			newCount := len(msg.instances)
 			uiLog.Debug("reload_load_sessions", slog.Int("old_count", oldCount), slog.Int("new_count", newCount), slog.String("profile", h.profile))
@@ -6596,6 +6635,20 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// repaint of the list — behind O(fleet) tmux round-trips. attachReturnSyncCmd
 		// carries the rationale; attachReturnSyncedMsg repaints when it lands.
 		syncCmd := h.attachReturnSyncCmd(msg.attachedSessionID)
+
+		// The session we just left is the one most likely to have gained turns
+		// while we were attached, and its cached timestamp is frozen at attach
+		// time. Refresh just that one - a single transcript tail read, not the
+		// whole fleet - so it sorts into its true position on this repaint
+		// instead of visibly jumping on the next tick.
+		if h.groupViewMode == session.GroupViewRecentFlat && msg.attachedSessionID != "" {
+			h.instancesMu.RLock()
+			returned := h.instanceByID[msg.attachedSessionID]
+			h.instancesMu.RUnlock()
+			if returned != nil {
+				returned.RefreshLastTurnAt()
+			}
+		}
 
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
