@@ -57,12 +57,12 @@ func (s *Server) handleMobileVoice(w http.ResponseWriter, r *http.Request) {
 	}
 	inst.RefreshLiveSessionIDs()
 
-	path := inst.GetJSONLPathForInstance()
+	path := inst.GetTranscriptPathForInstance()
 	if path == "" {
 		writeMobileError(w, http.StatusNotFound, "no transcript for this session")
 		return
 	}
-	text := lastAssistantText(cachedTranscriptTurns(path))
+	text := lastAssistantText(cachedTranscriptTurns(path, inst.Tool))
 	if strings.TrimSpace(text) == "" {
 		writeMobileError(w, http.StatusNotFound, "no assistant turn to read yet")
 		return
@@ -114,12 +114,12 @@ func (s *Server) handleMobileVoiceLatest(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]any{"available": false})
 	}
 
-	path := inst.GetJSONLPathForInstance()
+	path := inst.GetTranscriptPathForInstance()
 	if path == "" {
 		unavailable()
 		return
 	}
-	text := lastAssistantText(cachedTranscriptTurns(path))
+	text := lastAssistantText(cachedTranscriptTurns(path, inst.Tool))
 	if strings.TrimSpace(text) == "" {
 		unavailable()
 		return
