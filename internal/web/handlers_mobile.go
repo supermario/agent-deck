@@ -72,6 +72,13 @@ type mobileTranscriptResponse struct {
 	Status string       `json:"status"`
 	Turns  []mobileTurn `json:"turns"` // when afterIndex is given, only turns after it
 	Total  int          `json:"total"` // total turn count on the server (for incremental sync)
+
+	// Latest real assistant call, for the phone's "Opus 5 1M 46%" readout.
+	// Always computed over the whole transcript, even for an afterIndex delta,
+	// so incremental polling keeps it current. Omitted when unknown.
+	Model         string `json:"model,omitempty"`
+	ContextTokens int64  `json:"contextTokens,omitempty"`
+	ContextWindow int64  `json:"contextWindow,omitempty"`
 }
 
 // ---- shared helpers ----
@@ -389,8 +396,13 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 	// is the honest answer, not a sibling's history.
 	path := inst.GetTranscriptPathForInstance()
 	if path != "" {
-		all := cachedTranscriptTurns(path, inst.Tool)
+		all, meta := cachedTranscript(path, inst.Tool)
 		resp.Total = len(all)
+		if meta.ModelID != "" {
+			resp.Model = modelDisplayName(meta.ModelID)
+			resp.ContextTokens = meta.ContextTokens
+			resp.ContextWindow = resolveContextWindow(meta, claudeSettingsModel(inst))
+		}
 		if afterIndex > 0 {
 			if afterIndex <= len(all) {
 				resp.Turns = all[afterIndex:]
@@ -413,6 +425,7 @@ func (s *Server) handleMobileTranscript(w http.ResponseWriter, r *http.Request) 
 type transcriptCacheEntry struct {
 	offset int64
 	turns  []mobileTurn
+	meta   transcriptMeta // model + context usage of the latest real call
 }
 
 var (
@@ -421,29 +434,39 @@ var (
 )
 
 func cachedTranscriptTurns(path, tool string) []mobileTurn {
+	turns, _ := cachedTranscript(path, tool)
+	return turns
+}
+
+// cachedTranscript is cachedTranscriptTurns plus the transcript's model and
+// context usage, accumulated through the same incremental parse so polling a
+// live session never re-reads the whole file to find its latest usage.
+func cachedTranscript(path, tool string) ([]mobileTurn, transcriptMeta) {
 	transcriptCacheMu.Lock()
 	defer transcriptCacheMu.Unlock()
 
 	fi, err := os.Stat(path)
 	if err != nil {
-		turns, _ := parseTranscriptFrom(path, 0, tool)
-		return turns
+		var meta transcriptMeta
+		turns, _ := parseTranscriptFrom(path, 0, tool, &meta)
+		return turns, meta
 	}
 
 	entry := transcriptCache[path]
 	if entry == nil || fi.Size() < entry.offset {
-		turns, off := parseTranscriptFrom(path, 0, tool)
-		transcriptCache[path] = &transcriptCacheEntry{offset: off, turns: turns}
-		return turns
+		fresh := &transcriptCacheEntry{}
+		fresh.turns, fresh.offset = parseTranscriptFrom(path, 0, tool, &fresh.meta)
+		transcriptCache[path] = fresh
+		return fresh.turns, fresh.meta
 	}
 	if fi.Size() > entry.offset {
-		newTurns, off := parseTranscriptFrom(path, entry.offset, tool)
+		newTurns, off := parseTranscriptFrom(path, entry.offset, tool, &entry.meta)
 		if len(newTurns) > 0 {
 			entry.turns = append(entry.turns, newTurns...)
 		}
 		entry.offset = off
 	}
-	return entry.turns
+	return entry.turns, entry.meta
 }
 
 // parseTranscriptFrom reads a native agent transcript starting at byte offset
@@ -451,7 +474,10 @@ func cachedTranscriptTurns(path, tool string) []mobileTurn {
 // consumes complete lines (ending in '\n'); the returned offset is the position
 // after the last complete line, so a partially-written trailing record is
 // re-read next time rather than parsed truncated.
-func parseTranscriptFrom(path string, start int64, tool string) ([]mobileTurn, int64) {
+//
+// When meta is non-nil, each complete Claude line is also folded into it (see
+// transcriptMeta.observe); Codex rollouts have no equivalent usage records.
+func parseTranscriptFrom(path string, start int64, tool string, meta *transcriptMeta) ([]mobileTurn, int64) {
 	turns := []mobileTurn{}
 
 	f, err := os.Open(path)
@@ -466,6 +492,7 @@ func parseTranscriptFrom(path string, start int64, tool string) ([]mobileTurn, i
 		}
 	}
 
+	observeMeta := meta != nil && session.IsClaudeCompatible(tool)
 	r := bufio.NewReaderSize(f, 1024*1024)
 	offset := start
 	for {
@@ -475,6 +502,9 @@ func parseTranscriptFrom(path string, start int64, tool string) ([]mobileTurn, i
 			offset += int64(len(line))
 			if turn, ok := parseTurnLineForTool(line, tool); ok {
 				turns = append(turns, turn)
+			}
+			if observeMeta {
+				meta.observe(line)
 			}
 			continue
 		}
