@@ -4912,6 +4912,12 @@ func (i *Instance) Start() error {
 		return fmt.Errorf("tmux session not initialized")
 	}
 
+	// Pre-accept Claude's folder-trust prompt before anything spawns. A session
+	// started through the API or CLI has nobody watching the pane to answer it,
+	// so the dialog turns a "successful" start into a session that silently
+	// accepts no input. Best-effort: never fail a start over a prompt.
+	_ = EnsureClaudeFolderTrust(i)
+
 	// #1580 diagnosability: clear any stale spawn-failure sidecar and drop a
 	// spawn_attempt trace so a spawn that dies before anything else runs still
 	// leaves a durable record.
@@ -5229,6 +5235,12 @@ func (i *Instance) StartWithMessage(message string) error {
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
+
+	// Pre-accept Claude's folder-trust prompt before anything spawns. A session
+	// started through the API or CLI has nobody watching the pane to answer it,
+	// so the dialog turns a "successful" start into a session that silently
+	// accepts no input. Best-effort: never fail a start over a prompt.
+	_ = EnsureClaudeFolderTrust(i)
 
 	// Refuse a message this session has no way to receive, BEFORE spawning
 	// anything (PR #1942 review, P1a). The DeepSeek web profile is an HTTP
@@ -8851,6 +8863,11 @@ func (i *Instance) restart(env map[string]string) error {
 	// recording a failure against it if that pane died.
 	i.bumpSpawnGenAndBarrier()
 
+	// A restart can land in a directory this config dir has never trusted (a
+	// moved worktree, a switched account), so it needs the same pre-accept as a
+	// cold start.
+	_ = EnsureClaudeFolderTrust(i)
+
 	if len(env) > 0 {
 		i.restartEnv = make(map[string]string, len(env))
 		for key, value := range env {
@@ -9459,6 +9476,11 @@ func (i *Instance) RestartFresh() error {
 	// likewise unconditional — an old watcher whose session is already gone is
 	// the one most likely to write a spurious failure.
 	i.bumpSpawnGenAndBarrier()
+
+	// A restart can land in a directory this config dir has never trusted (a
+	// moved worktree, a switched account), so it needs the same pre-accept as a
+	// cold start.
+	_ = EnsureClaudeFolderTrust(i)
 
 	if i.tmuxSession != nil && i.tmuxSession.Exists() {
 		if killErr := i.tmuxSession.Kill(); killErr != nil {

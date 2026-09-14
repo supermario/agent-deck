@@ -69,6 +69,79 @@ func PreAcceptClaudeTrust(claudeJSONPath, parentDir string) error {
 	return nil
 }
 
+// claudeTrustFilePath returns the .claude.json that Claude will actually read
+// for this instance.
+//
+// The location is NOT simply "inside the config dir": with no CLAUDE_CONFIG_DIR
+// Claude reads ~/.claude.json in HOME, while ~/.claude is only the data dir
+// (there is no ~/.claude/.claude.json). With an explicit config dir it reads
+// <dir>/.claude.json. Writing to the wrong one is silent — the file is created,
+// the prompt still appears — so the default case must resolve to HOME.
+//
+// Best-effort for alias commands (cdw/cdp): those resolve their own config dir
+// inside the alias, which is invisible here, so an aliased session may still
+// see the prompt once.
+func claudeTrustFilePath(inst *Instance) string {
+	if IsClaudeConfigDirExplicitForInstance(inst) {
+		if dir := GetClaudeConfigDirForInstance(inst); dir != "" {
+			return filepath.Join(dir, ".claude.json")
+		}
+	}
+	return GetUserMCPRootPath()
+}
+
+// EnsureClaudeFolderTrust pre-accepts Claude's "Do you trust this folder?"
+// prompt for the instance's working directory.
+//
+// Without it, the first launch of any (config dir, cwd) pair Claude has not seen
+// blocks on an interactive prompt. That is merely annoying when a human is
+// watching the pane, and a hang when nobody is: an API/CLI-driven start returns
+// success, the pane sits on the dialog, and every message delivered to it lands
+// in a prompt that is not accepting input. The same reasoning already justified
+// pre-seeding for multi-repo (#1149), conductors, loadouts and account switches
+// — this extends it to ordinary starts and restarts.
+//
+// Best-effort by contract: returns nil for anything not a Claude session with a
+// working directory, and callers ignore the error. Failing to skip a prompt must
+// never fail a session start.
+func EnsureClaudeFolderTrust(inst *Instance) error {
+	if inst == nil || !IsClaudeCompatible(inst.Tool) {
+		return nil
+	}
+	// An SSH session's path names a directory on another host; trust there is
+	// not ours to grant, and the path would be meaningless in a local config.
+	if inst.IsSSH() {
+		return nil
+	}
+	dir := strings.TrimSpace(inst.EffectiveWorkingDir())
+	if dir == "" {
+		return nil
+	}
+	trustFile := claudeTrustFilePath(inst)
+	if trustFile == "" {
+		return nil
+	}
+
+	// Trust is keyed by the literal path string, and Claude keys it by the
+	// SYMLINK-RESOLVED one: on macOS a session in /var/folders/... shows up as
+	// /private/var/folders/... because /var is a symlink to /private/var. Seeding
+	// only the unresolved form writes an entry that is never read — the file
+	// gains a trusted project and the prompt still blocks the pane. Seed both
+	// when they differ, since either spelling can be the one that gets looked up.
+	seen := map[string]bool{}
+	var firstErr error
+	for _, candidate := range []string{dir, resolveRealPath(dir)} {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		if err := PreAcceptClaudeTrust(trustFile, candidate); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // WriteMultiRepoParentClaudeMD writes a .claude/CLAUDE.md to parentDir telling
 // Claude that this is a multi-repo session, which subdirectories contain real
 // repos, how to scope commands, and @path imports for each child project's
