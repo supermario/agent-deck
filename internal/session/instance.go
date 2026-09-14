@@ -10436,6 +10436,42 @@ func (i *Instance) GetTmuxSession() *tmux.Session {
 	return i.tmuxSession
 }
 
+// EnsureRunning brings a dead session back so a message can be delivered to it,
+// and reports whether it actually had to restart anything.
+//
+// This exists so callers can express "deliver this message" instead of
+// coordinating a liveness check, a restart and a retry themselves — every
+// consumer that skipped that dance silently dropped messages into dead
+// sessions, which is indistinguishable from the message never being sent.
+//
+// Restart() resumes the conversation for a Claude session with a known id, so a
+// revived session keeps its context. That matters here: the caller is
+// CONTINUING a conversation, and delivering into a cold session would strip the
+// history the message refers to.
+//
+// Only guarantees the tmux session is back. The agent inside it is still
+// booting, so callers must keep their usual readiness wait (send.WaitForAgentReady)
+// before typing — and should allow more time than usual, since a resume is
+// slower than an already-warm prompt.
+func (i *Instance) EnsureRunning(timeout time.Duration) (bool, error) {
+	if i.Exists() {
+		return false, nil
+	}
+	if err := i.Restart(); err != nil {
+		return false, fmt.Errorf("restart dead session %q: %w", i.Title, err)
+	}
+	deadline := nowFn().Add(timeout)
+	for {
+		if i.Exists() {
+			return true, nil
+		}
+		if !nowFn().Before(deadline) {
+			return true, fmt.Errorf("session %q did not come back within %s", i.Title, timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // Substate returns the additive Honest-Status-v2 refinement for this session
 // (see Substate). It reads the live tmux pane and classifies it; SubstateNone
 // when there is no tmux session, the pane is dead, or the tool has no substate

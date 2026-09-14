@@ -742,6 +742,14 @@ func truncateSummary(s string, n int) string {
 
 // ---- POST /api/mobile/session/{id}/send ----
 
+// How long to wait for a revived session's tmux to come back, and then for the
+// agent inside it to present a prompt. A resume replays the conversation, so the
+// second is generous on purpose — giving up early would drop the message.
+const (
+	mobileReviveTimeout      = 30 * time.Second
+	mobileReviveReadyTimeout = 90 * time.Second
+)
+
 func (s *Server) handleMobileSend(w http.ResponseWriter, r *http.Request) {
 	if handledPreflight(w, r) {
 		return
@@ -774,26 +782,44 @@ func (s *Server) handleMobileSend(w http.ResponseWriter, r *http.Request) {
 		writeMobileError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	if !inst.Exists() {
-		writeMobileError(w, http.StatusConflict, "session is not running")
-		return
-	}
-	tmuxSess := inst.GetTmuxSession()
-	if tmuxSess == nil {
-		writeMobileError(w, http.StatusConflict, "could not determine tmux session")
-		return
-	}
+	// A dead session used to be rejected with 409 here, which the phone showed
+	// as the message bouncing straight back out of the composer — after a
+	// restart, when every session is dead, that made the app look broken. The
+	// caller asked us to DELIVER a message; reviving the session is our job, not
+	// theirs. EnsureRunning resumes the conversation, so the message lands in
+	// context rather than in a cold session.
+	needsRestart := !inst.Exists()
 
-	// Fire the readiness wait + keystrokes in the background and ack the phone
-	// immediately: WaitForAgentReady can block for seconds while the composer
-	// mounts, and the phone already echoes the message optimistically, so there
-	// is nothing to gain from making it wait on the HTTP response.
+	// Fire the restart + readiness wait + keystrokes in the background and ack
+	// the phone immediately: WaitForAgentReady can block for seconds while the
+	// composer mounts (much longer behind a restart), and the phone already
+	// echoes the message optimistically, so there is nothing to gain from making
+	// it wait on the HTTP response.
 	go func() {
-		_ = send.WaitForAgentReady(tmuxSess, inst.Tool, 8*time.Second, send.PromptGates{
+		if needsRestart {
+			if _, err := inst.EnsureRunning(mobileReviveTimeout); err != nil {
+				return
+			}
+		}
+		// Resolve the tmux session AFTER any restart: the revived session is a
+		// new tmux session, so a handle captured beforehand points at a corpse.
+		tmuxSess := inst.GetTmuxSession()
+		if tmuxSess == nil {
+			return
+		}
+		// A just-resumed agent is replaying its conversation and takes far
+		// longer to present a prompt than a warm one.
+		readyTimeout := 8 * time.Second
+		if needsRestart {
+			readyTimeout = mobileReviveReadyTimeout
+		}
+		_ = send.WaitForAgentReady(tmuxSess, inst.Tool, readyTimeout, send.PromptGates{
 			ClaudeComposer: session.IsClaudeCompatible(inst.Tool),
 			CodexPrompt:    session.IsCodexCompatible(inst.Tool),
 		})
 		_ = tmuxSess.SendKeysAndEnter(text)
 	}()
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	// "restarted" lets a client say "waking the session…" instead of guessing
+	// why the reply is slow. Clients that ignore it are unaffected.
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restarted": needsRestart})
 }

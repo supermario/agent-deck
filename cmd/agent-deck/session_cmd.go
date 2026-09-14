@@ -2807,6 +2807,7 @@ func handleSessionSend(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("q", false, "Quiet mode")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
+	noRestart := fs.Bool("no-restart", false, "Fail instead of reviving a session whose process has died")
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
 	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
@@ -2902,20 +2903,37 @@ func handleSessionSend(profile string, args []string) {
 		}
 	}
 
-	// Check if session is running
-	if !inst.Exists() {
-		out.Error(fmt.Sprintf("session '%s' is not running", inst.Title), ErrCodeInvalidOperation)
-		os.Exit(1)
-	}
-
 	// PR #1942 review (P1a): refuse a send the target cannot receive. A DeepSeek
 	// web-profile pane runs an HTTP server with no terminal prompt, so keystrokes
 	// go to the server process's stdin and vanish while this command reports
 	// success. Silent message loss is the worst failure class here, so it is a
 	// hard refusal rather than a warning. Every other tool returns nil.
+	// Checked before the revive below: it depends only on configuration, so a
+	// send that is going to be refused must not restart the session first.
 	if err := inst.PromptDeliveryError(); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// A dead session is a delivery problem, not a reason to refuse. Callers asked
+	// us to deliver a message; every one of them that had to notice "not
+	// running" and orchestrate a restart itself was re-implementing this, and
+	// the ones that didn't silently dropped messages into corpses. Restart
+	// resumes the conversation, so the message arrives in context.
+	// --no-restart keeps the old refusal for callers that want liveness to be an
+	// error (health checks, scripts asserting a session is up).
+	revived := false
+	if !inst.Exists() {
+		if *noRestart {
+			out.Error(fmt.Sprintf("session '%s' is not running", inst.Title), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		var err error
+		revived, err = inst.EnsureRunning(30 * time.Second)
+		if err != nil {
+			out.Error(fmt.Sprintf("session '%s' is not running and could not be revived: %v", inst.Title, err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
 	}
 
 	if shouldSkipConductorHeartbeatSend(inst, message) {
@@ -3064,6 +3082,10 @@ func handleSessionSend(profile string, args []string) {
 			"session_id":    inst.ID,
 			"session_title": inst.Title,
 			"message":       message,
+			// Tells a caller its message went to a session we had to bring back,
+			// which is worth surfacing: the agent resumed rather than continuing
+			// uninterrupted, so anything it was mid-way through is gone.
+			"revived": revived,
 		}
 		for k, v := range sendRes.jsonFields() {
 			data[k] = v
@@ -5002,4 +5024,3 @@ func handleSessionSearch(profile string, args []string) {
 		}
 	}
 }
-
