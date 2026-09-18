@@ -32,8 +32,13 @@ func TestStorageWatcherAccountOneRefreshComposition(t *testing.T) {
 	require.Equal(t, "reviewer", h.getSessionRenderState(loaded).account)
 	var row strings.Builder
 	h.renderSessionItem(&row, session.Item{Type: session.ItemTypeSession, Session: loaded, Level: 1, Path: "work", IsLastInGroup: true}, false, h.getSessionRenderSnapshot(), 240)
-	require.Contains(t, row.String(), `[account:"reviewer"]`)
-	require.Contains(t, h.renderSessionInfoCard(loaded, 240, 40), `"reviewer"`)
+	// The badge names the resolved Claude config dir, not the stored slot. This
+	// machine declares no [profiles.reviewer.claude] block, so "reviewer"
+	// resolves to the default dir and the row must not invent a label for it.
+	// The slot itself still has to survive the reload, which is the subject here.
+	require.NotContains(t, row.String(), "[work")
+	require.Equal(t, accountPresentation{}, h.getSessionRenderState(loaded).accountDisplay)
+	require.NotContains(t, h.renderSessionInfoCard(loaded, 240, 40), "Claude config:")
 	_, _ = h.Update(old)
 	require.Equal(t, "reviewer", h.getSessionRenderState(h.getInstanceByID(inst.ID)).account, "late old load reverted account snapshot")
 }

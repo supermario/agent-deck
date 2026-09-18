@@ -603,15 +603,12 @@ type Home struct {
 	// one. Cached here so all rows of a frame agree; reloaded after panel save.
 	showPaneTitles bool
 
-	// accountSlotsConfigured mirrors len(session.ConfiguredAccountNames(cfg)) > 0,
-	// the same gate the New/Edit Session dialogs use to hide their account rows
-	// (#2152). A machine with no [profiles.<name>.claude].config_dir block has
-	// one login, so "which slot is this session on" is not a question that can
-	// have two answers — the inherited badge would be dead width on every row.
-	// Atomic because refreshSessionRenderSnapshot reads it from the background
-	// refresher goroutine while the settings panel writes it from the Bubble Tea
-	// event loop. Explicit slots ignore this gate; see newAccountPresentation.
-	accountSlotsConfigured atomic.Bool
+	// accountLabels maps session ID -> the Claude config-dir label its row shows
+	// (empty for the ordinary ~/.claude). Resolved on the event loop in
+	// rebuildFlatItemsAt, the only place Instance.GroupPath is safe to read, and
+	// consumed by the snapshot refresher on its own goroutine - hence an
+	// atomic.Value published whole, like sessionRenderSnapshot.
+	accountLabels atomic.Value // map[string]string
 
 	// Sessions/Preview split (issue #1092): percentage of width allocated to
 	// preview pane. Loaded from config.toml [ui] preview_pct, adjustable
@@ -2040,9 +2037,6 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 
 	// Hook-based status detection (Claude Code lifecycle hooks)
 	userConfig, _ := session.LoadUserConfig()
-	// Seed the account-badge gate from the same config read; the settings panel
-	// refreshes it on save so adding a slot lights the badges without a restart.
-	h.accountSlotsConfigured.Store(len(session.ConfiguredAccountNames(userConfig)) > 0)
 	hooksEnabled := userConfig == nil || userConfig.Claude.GetHooksEnabled()
 	if homeBackgroundWorkersEnabled && hooksEnabled {
 		configDir := session.GetClaudeConfigDir()
@@ -3133,6 +3127,10 @@ func (h *Home) rebuildFlatItems() {
 
 func (h *Home) rebuildFlatItemsAt(now time.Time) {
 	h.nextTimeFilterExpiry = time.Time{}
+	// Config-dir labels for the row badges. Here because this runs on the event
+	// loop with the group tree in hand, so GroupPath reads are safe and each
+	// session's group path is known without touching Instance.
+	h.refreshAccountLabels()
 	h.jumpMode = false
 	h.jumpBuffer = ""
 
@@ -5684,25 +5682,95 @@ func (h *Home) getSessionRenderSnapshot() map[string]sessionRenderState {
 	return nil
 }
 
-// setAccountSlotsConfigured updates only inherited account presentations when
-// settings cross the configured/unconfigured boundary. Copy the snapshot so
-// active renderers keep an immutable view, without rereading session state.
-func (h *Home) setAccountSlotsConfigured(configured bool) {
+// refreshAccountLabels re-resolves every session's Claude config-dir label and
+// returns the published map.
+//
+// Runs on the event loop, where GroupPath can be read without racing
+// MoveSessionToGroup. Memoised per (account, group, conductor) triple so a
+// hundred-session deck resolves config a handful of times instead of per row;
+// the conductor part only participates when the title actually carries the
+// prefix the resolver keys on, so ordinary rows still share one entry.
+func (h *Home) refreshAccountLabels() map[string]string {
+	labels := make(map[string]string)
+	if h.groupTree == nil {
+		h.accountLabels.Store(labels)
+		return labels
+	}
+	memo := make(map[string]string)
+	for _, g := range h.groupTree.Groups {
+		if g == nil {
+			continue
+		}
+		for _, inst := range g.Sessions {
+			// Every tool, not just Claude: agent-deck exports the resolved
+			// CLAUDE_CONFIG_DIR into the session's environment, so a shell
+			// opened in a work group really does run against that account the
+			// moment anyone types claude in it.
+			if inst == nil {
+				continue
+			}
+			account := inst.GetAccountThreadSafe()
+			title := inst.GetTitleThreadSafe()
+			conductor := ""
+			if strings.HasPrefix(title, "conductor-") {
+				conductor = title
+			}
+			key := account + "\x00" + g.Path + "\x00" + conductor
+			label, ok := memo[key]
+			if !ok {
+				label = session.NonDefaultClaudeConfigLabel(account, g.Path, title)
+				memo[key] = label
+			}
+			if label != "" {
+				labels[inst.ID] = label
+			}
+		}
+	}
+	h.accountLabels.Store(labels)
+	return labels
+}
+
+// accountLabelFor returns a session's config-dir label, empty when it runs on
+// the default dir or labels have not been resolved yet.
+func (h *Home) accountLabelFor(id string) string {
+	labels, _ := h.accountLabels.Load().(map[string]string)
+	return labels[id]
+}
+
+// sameAccountLabels reports whether two published label maps agree, so a
+// settings save that changed nothing relevant leaves the snapshot untouched.
+func sameAccountLabels(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id, label := range a {
+		if b[id] != label {
+			return false
+		}
+	}
+	return true
+}
+
+// refreshAccountLabelsAfterConfigChange reacts to a settings save. The badge keys off the
+// resolved config dir rather than whether named slots exist, but a save can
+// rewrite the group/profile config_dir blocks that resolution reads, so labels
+// are recomputed and the published presentations refreshed. A save that changes
+// no label leaves the snapshot pointer alone. Copy the snapshot so active
+// renderers keep an immutable view, without rereading session state.
+func (h *Home) refreshAccountLabelsAfterConfigChange() {
+	previous, _ := h.accountLabels.Load().(map[string]string)
+	if sameAccountLabels(previous, h.refreshAccountLabels()) {
+		return
+	}
 	h.sessionRenderSnapshotMu.Lock()
 	defer h.sessionRenderSnapshotMu.Unlock()
-	if h.accountSlotsConfigured.Swap(configured) == configured {
+	published := h.getSessionRenderSnapshot()
+	if len(published) == 0 {
 		return
 	}
-	previous := h.getSessionRenderSnapshot()
-	if len(previous) == 0 {
-		return
-	}
-	snap := make(map[string]sessionRenderState, len(previous))
-	display := newAccountPresentation("", configured)
-	for id, state := range previous {
-		if state.account == "" {
-			state.accountDisplay = display
-		}
+	snap := make(map[string]sessionRenderState, len(published))
+	for id, state := range published {
+		state.accountDisplay = newAccountPresentation(h.accountLabelFor(id))
 		snap[id] = state
 	}
 	h.sessionRenderSnapshot.Store(snap)
@@ -5715,13 +5783,13 @@ func (h *Home) setAccountSlotsConfigured(configured bool) {
 func (h *Home) publishSessionRenderSnapshot(snap map[string]sessionRenderState) {
 	h.sessionRenderSnapshotMu.Lock()
 	defer h.sessionRenderSnapshotMu.Unlock()
-	accounts := make(map[string]accountPresentation)
-	slotsConfigured := h.accountSlotsConfigured.Load()
+	presentations := make(map[string]accountPresentation)
 	for id, state := range snap {
-		display, ok := accounts[state.account]
+		label := h.accountLabelFor(id)
+		display, ok := presentations[label]
 		if !ok {
-			display = newAccountPresentation(state.account, slotsConfigured)
-			accounts[state.account] = display
+			display = newAccountPresentation(label)
+			presentations[label] = display
 		}
 		state.accountDisplay = display
 		snap[id] = state
@@ -5800,7 +5868,7 @@ func (h *Home) getSessionRenderState(inst *session.Instance) sessionRenderState 
 		status:         inst.GetStatusThreadSafe(),
 		tool:           inst.GetToolThreadSafe(),
 		account:        account,
-		accountDisplay: newAccountPresentation(account, h.accountSlotsConfigured.Load()),
+		accountDisplay: newAccountPresentation(h.accountLabelFor(inst.ID)),
 		title:          inst.GetTitleThreadSafe(),
 		autoName:       inst.GetAutoName(),
 		autoNameDesc:   inst.GetAutoNameDescription(),
@@ -9449,7 +9517,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.reloadHotkeysFromConfig()
 				h.showSessionTimestamps = config.Display.ShowSessionTimestamps
 				h.showPaneTitles = config.Display.ShowPaneTitles
-				h.setAccountSlotsConfigured(len(session.ConfiguredAccountNames(config)) > 0)
+				h.refreshAccountLabelsAfterConfigChange()
 
 				// Apply theme changes live
 				h.stopThemeWatcher()
@@ -21073,12 +21141,12 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 	// Tool
 	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tool:"), valueStyle.Render(cardTool)))
 
-	// Use the same cached metadata as the row; no account/config resolution.
-	// An empty label means the row suppressed the badge (single-login machine,
-	// inherited slot) — drop the whole line rather than print an empty value.
+	// Use the same cached label as the row; no resolution on the card path. An
+	// empty label means this session runs on the default ~/.claude, so the line
+	// is dropped rather than printed empty.
 	if account := h.getSessionRenderState(inst).accountDisplay.label; account != "" {
-		account = cellTruncate(account, max(0, width-cellWidth("Account slot: ")), "…")
-		b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Account slot:"), valueStyle.Render(account)))
+		account = cellTruncate(account, max(0, width-cellWidth("Claude config: ")), "…")
+		b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Claude config:"), valueStyle.Render(account)))
 	}
 
 	// Session ID (if available) - Claude, Gemini, OpenCode, or generic (Hermes/custom tools)

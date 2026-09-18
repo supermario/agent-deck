@@ -2,117 +2,107 @@ package ui
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
-func TestAccountSlotsConfigurationTransition(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		configured bool
-	}{
-		{name: "first account added", configured: true},
-		{name: "last account removed", configured: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := &Home{width: 240, height: 40, cursor: 1}
-			h.accountSlotsConfigured.Store(!tc.configured)
-			inherited := &session.Instance{ID: "inherited", Title: "follows-chain", Tool: "shell", Status: session.StatusIdle}
-			unknown := &session.Instance{ID: "unknown", Title: "unknown-slot", Tool: "shell", Status: session.StatusIdle, Account: "unknown-slot"}
-			h.instances = []*session.Instance{inherited, unknown}
-			for _, inst := range h.instances {
-				h.flatItems = append(h.flatItems, session.Item{Type: session.ItemTypeSession, Session: inst, Level: 1, IsLastInGroup: true})
-			}
-			before := map[string]sessionRenderState{}
-			for _, inst := range h.instances {
-				before[inst.ID] = sessionRenderState{
-					status: session.StatusError, substate: session.SubstateModelUnavailable,
-					tool: "shell", title: "cached title", paneTitle: "cached pane title",
-					autoName: true, autoNameDesc: "cached description", account: inst.Account,
-					accountDisplay: newAccountPresentation(inst.Account, !tc.configured),
-				}
-			}
-			h.sessionRenderSnapshot.Store(before)
+// Editing config.toml changes which dir a session resolves to, so a settings
+// save has to re-resolve labels and refresh the already-published rows. Without
+// this the badge would only catch up on the next list rebuild.
+func TestConfigChangeRefreshesPublishedLabels(t *testing.T) {
+	home := isolatedConfigHome(t)
+	writeClaudeDirsConfig(t, home, nil, nil)
 
-			// This is the settings-save gate update, with an existing snapshot.
-			h.setAccountSlotsConfigured(tc.configured)
+	inst := claudeSession("work-session", "atlas-checker", "work")
+	h := homeWithSessions(t, 240, inst)
+	require.Equal(t, accountPresentation{}, h.getSessionRenderState(inst).accountDisplay,
+		"precondition: no group override yet, so no badge")
 
-			require.Equal(t, tc.configured, h.accountSlotsConfigured.Load())
-			require.Equal(t, 1, h.cursor)
-			require.Same(t, unknown, h.getSelectedSession())
-			require.Equal(t, []*session.Instance{inherited, unknown}, h.instances)
-			require.Equal(t, "follows-chain", inherited.GetTitleThreadSafe())
-			require.Equal(t, "unknown-slot", unknown.GetTitleThreadSafe())
-			require.Len(t, h.getSessionRenderSnapshot(), len(before))
-			for i, inst := range h.instances {
-				want := before[inst.ID]
-				want.accountDisplay = newAccountPresentation(inst.Account, tc.configured)
-				require.Equal(t, want, h.getSessionRenderState(inst), "only the account presentation may change")
-				require.Equal(t, newAccountPresentation(inst.Account, !tc.configured), before[inst.ID].accountDisplay,
-					"an already published snapshot must remain immutable")
-				require.Equal(t, before[inst.ID].account, inst.GetAccountThreadSafe())
-				require.Equal(t, session.StatusIdle, inst.GetStatusThreadSafe())
-				require.Equal(t, "shell", inst.GetToolThreadSafe())
-				require.Equal(t, h.flatItems[i].Session, inst)
-				for _, selected := range []bool{false, true} {
-					var row strings.Builder
-					h.renderSessionItem(&row, h.flatItems[i], selected, h.getSessionRenderSnapshot(), 240)
-					require.Contains(t, row.String(), "cached pane title")
-					if inst == inherited && !tc.configured {
-						require.NotContains(t, row.String(), "[account:")
-					} else {
-						require.Contains(t, row.String(), strings.TrimSpace(want.accountDisplay.badge))
-					}
-				}
-				card := h.renderSessionInfoCard(inst, 240, 40)
-				if inst == inherited && !tc.configured {
-					require.NotContains(t, card, "Account slot:")
-				} else {
-					require.Contains(t, card, "Account slot:")
-					require.Contains(t, card, want.accountDisplay.label)
-				}
-			}
-		})
-	}
+	// The user adds [groups."work".claude] config_dir and saves settings.
+	writeClaudeDirsConfig(t, home, map[string]string{"work": ".claude-work"}, nil)
+	h.refreshAccountLabelsAfterConfigChange()
+
+	require.Equal(t, "work", h.getSessionRenderState(inst).accountDisplay.label,
+		"the published snapshot must pick up the new dir")
+	require.Contains(t, renderRow(t, h, inst, false), "[work]")
+	require.Contains(t, h.renderSessionInfoCard(inst, 240, 40), "Claude config:")
+
+	// Removing it again takes the badge away.
+	writeClaudeDirsConfig(t, home, nil, nil)
+	h.refreshAccountLabelsAfterConfigChange()
+	require.Equal(t, accountPresentation{}, h.getSessionRenderState(inst).accountDisplay)
+	require.NotContains(t, renderRow(t, h, inst, false), "[work]")
 }
 
-func TestAccountSlotsConfigurationUnchangedKeepsSnapshot(t *testing.T) {
-	for _, configured := range []bool{false, true} {
-		h := &Home{}
-		h.accountSlotsConfigured.Store(configured)
-		before := map[string]sessionRenderState{"session": {title: "cached title"}}
-		h.sessionRenderSnapshot.Store(before)
-		h.setAccountSlotsConfigured(configured)
-		require.Equal(t, reflect.ValueOf(before).Pointer(), reflect.ValueOf(h.getSessionRenderSnapshot()).Pointer(),
-			"saving settings without a gate transition must not rebuild the snapshot")
-	}
+// A save that changes no label must not rebuild the snapshot: active renderers
+// hold it, and churning it costs a copy of every row for nothing.
+func TestConfigChangeWithoutLabelChangeKeepsSnapshot(t *testing.T) {
+	home := isolatedConfigHome(t)
+	writeClaudeDirsConfig(t, home, map[string]string{"work": ".claude-work"}, nil)
+
+	inst := claudeSession("work-session", "atlas-checker", "work")
+	h := homeWithSessions(t, 240, inst)
+	before := h.getSessionRenderSnapshot()
+	require.Equal(t, "work", before[inst.ID].accountDisplay.label)
+
+	h.refreshAccountLabelsAfterConfigChange()
+
+	require.Equal(t, reflect.ValueOf(before).Pointer(), reflect.ValueOf(h.getSessionRenderSnapshot()).Pointer(),
+		"saving settings with no label change must not rebuild the snapshot")
 }
 
-func TestAccountSlotsConfigurationBeforeSnapshot(t *testing.T) {
+// A settings save before any session data exists must not invent rows.
+func TestConfigChangeBeforeSnapshot(t *testing.T) {
+	home := isolatedConfigHome(t)
+	writeClaudeDirsConfig(t, home, map[string]string{"work": ".claude-work"}, nil)
+
+	// A bare Home, not NewHome: this pins the pre-session path, and NewHome
+	// publishes an empty snapshot of its own.
 	h := &Home{}
-	inst := &session.Instance{ID: "new", Tool: "shell", Status: session.StatusIdle}
-	for _, configured := range []bool{true, false} {
-		h.setAccountSlotsConfigured(configured)
-		require.Nil(t, h.getSessionRenderSnapshot(), "do not create session data during a settings change")
-		require.Equal(t, newAccountPresentation("", configured), h.getSessionRenderState(inst).accountDisplay)
-	}
+	h.refreshAccountLabelsAfterConfigChange()
+	require.Nil(t, h.getSessionRenderSnapshot(), "do not create session data during a settings change")
 }
 
-func TestAccountSnapshotPublicationUsesCurrentConfiguration(t *testing.T) {
-	for _, configured := range []bool{false, true} {
-		h := &Home{}
-		h.accountSlotsConfigured.Store(!configured)
-		// A background refresh started before the settings save and publishes later.
-		pending := map[string]sessionRenderState{
-			"session": {title: "fresh title", accountDisplay: newAccountPresentation("", !configured)},
-		}
-		h.setAccountSlotsConfigured(configured)
-		h.publishSessionRenderSnapshot(pending)
-		state := h.getSessionRenderSnapshot()["session"]
-		require.Equal(t, "fresh title", state.title)
-		require.Equal(t, newAccountPresentation("", configured), state.accountDisplay)
+// A background refresh that started before a config change still publishes with
+// the labels current at publication, not the ones it began with.
+func TestPublicationUsesCurrentLabels(t *testing.T) {
+	home := isolatedConfigHome(t)
+	writeClaudeDirsConfig(t, home, map[string]string{"work": ".claude-work"}, nil)
+
+	inst := claudeSession("work-session", "atlas-checker", "work")
+	h := homeWithSessions(t, 240, inst)
+
+	// In-flight refresh result, carrying a stale presentation.
+	pending := map[string]sessionRenderState{
+		inst.ID: {title: "fresh title", accountDisplay: newAccountPresentation("stale")},
 	}
+	h.publishSessionRenderSnapshot(pending)
+
+	state := h.getSessionRenderState(inst)
+	require.Equal(t, "fresh title", state.title, "the refresh's own data must survive")
+	require.Equal(t, "work", state.accountDisplay.label, "but the label comes from the current resolution")
+}
+
+// A slot arriving from outside this process (another agent-deck writing
+// state.db, which is what `session switch-account` does) must move the badge on
+// the next refresh: that is how the operator sees the switch actually took.
+func TestAccountChangeFromStorageMovesBadge(t *testing.T) {
+	home := isolatedConfigHome(t)
+	writeClaudeDirsConfig(t, home, nil, map[string]string{"claude-work": ".claude-work"})
+
+	inst := claudeSession("switcher", "mos-rec", "my-sessions")
+	h := homeWithSessions(t, 240, inst)
+	require.Equal(t, accountPresentation{}, h.getSessionRenderState(inst).accountDisplay,
+		"precondition: no slot, default dir, no badge")
+
+	// What a reload hands back once the slot is set. Sequential mutation; no
+	// concurrent writer, so a direct assignment is the honest fixture here.
+	inst.Account = "claude-work"
+	h.refreshAccountLabels()
+	h.refreshSessionRenderSnapshot(h.instances)
+
+	require.Equal(t, "work", h.getSessionRenderState(inst).accountDisplay.label)
+	require.Contains(t, renderRow(t, h, inst, false), "[work]")
+	require.Contains(t, h.renderSessionInfoCard(inst, 240, 40), "Claude config:")
 }

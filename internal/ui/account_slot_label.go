@@ -1,47 +1,41 @@
 package ui
 
-import "strconv"
+// The row badge names the Claude config dir a session runs against, and only
+// when that is not the ordinary ~/.claude.
+//
+// Upstream #2122/#2238 badged the stored account slot instead, labelling every
+// session without one "inherited". On a machine whose work sessions inherit
+// ~/.claude-work from [groups."work".claude] that reads backwards: the handful
+// pinned with `switch-account` were named, the rest were called inherited, and
+// the answer to "which of these is on the work account" was absent from the one
+// place it matters. Resolving the dir answers it for both, and a session on the
+// default dir needs no badge at all, so the common row stays clean.
 
-// Empty metadata means no explicit slot, not a claim about the running login.
-func storedAccountLabel(account string) string {
-	if account == "" {
-		return "inherited"
-	}
-	return strconv.Quote(account)
-}
+const storedAccountPrefix = " ["
 
-const storedAccountPrefix = " [account:"
-
-// Immutable presentation travels with the raw slot in the render snapshot.
-// Width-independent quoting is shared across rows with the same stored slot.
+// Immutable presentation travels with the resolved label in the render
+// snapshot. Width-independent for rows that share a label.
 type accountPresentation struct {
-	label  string
-	badge  string
-	width  int
-	quoted bool
+	label string
+	badge string
+	width int
 }
 
-// slotsConfigured reports whether this machine has any named account slot. An
-// empty stored slot only carries information when it could have been something
-// else, so on a single-login machine the inherited badge is suppressed entirely
-// (zero value: no badge, no width). An explicit slot always renders — a session
-// can hold a slot whose profile was since removed from config.toml, and hiding
-// that would misreport which config dir the session actually runs on.
-func newAccountPresentation(account string, slotsConfigured bool) accountPresentation {
-	if account == "" && !slotsConfigured {
+// newAccountPresentation builds the badge for an already-resolved label. An
+// empty label is the zero value: no badge, no reserved width.
+func newAccountPresentation(label string) accountPresentation {
+	if label == "" {
 		return accountPresentation{}
 	}
-	label := storedAccountLabel(account)
 	return accountPresentation{
-		label:  label,
-		badge:  storedAccountPrefix + label + "]",
-		width:  len(storedAccountPrefix) + cellWidth(label) + 1,
-		quoted: account != "",
+		label: label,
+		badge: storedAccountPrefix + label + "]",
+		width: len(storedAccountPrefix) + cellWidth(label) + 1,
 	}
 }
 
-// Quote before styling/truncation so terminal controls cannot become commands.
-// Keep the delimiters visible even when a long account needs an ellipsis.
+// fit truncates to the row's remaining budget, keeping the delimiters visible
+// so a shortened label still reads as a badge rather than stray text.
 func (p accountPresentation) fit(budget int) (string, int) {
 	if p.width <= budget {
 		return p.badge, p.width
@@ -50,14 +44,6 @@ func (p accountPresentation) fit(budget int) (string, int) {
 	if available < 1 {
 		return "", 0
 	}
-	label := p.label
-	if p.quoted {
-		if available < 3 {
-			return "", 0
-		}
-		label = "\"" + cellTruncate(label[1:len(label)-1], available-2, "…") + "\""
-	} else {
-		label = cellTruncate(label, available, "…")
-	}
+	label := cellTruncate(p.label, available, "…")
 	return storedAccountPrefix + label + "]", len(storedAccountPrefix) + cellWidth(label) + 1
 }

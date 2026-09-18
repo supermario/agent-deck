@@ -10,27 +10,47 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStoredAccountWidthMatrix(t *testing.T) {
-	for _, slot := range []string{"", "personal", strings.Repeat("日本e\u03011️⃣🚀", 20), "\x1b]0;bad\a\r\n\u202e"} {
+// The badge shares the row's title budget, so every label length has to stay
+// inside the terminal width at every width, selected or not.
+func TestConfigDirLabelWidthMatrix(t *testing.T) {
+	labels := []string{
+		"",
+		"work",
+		strings.Repeat(".claude-日本é\U0001f680", 20),
+	}
+	for _, label := range labels {
 		for _, width := range []int{24, 40, 72, 120} {
 			for _, auto := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%q/%d/auto=%v", slot, width, auto), func(t *testing.T) {
+				t.Run(fmt.Sprintf("%.24q/%d/auto=%v", label, width, auto), func(t *testing.T) {
 					h := NewHome()
 					h.width, h.height = width, 40
-					inst := &session.Instance{ID: "width", Title: strings.Repeat("Title日本e\u0301", 8), Tool: "shell", Status: session.StatusIdle, Account: slot}
-					state := sessionRenderState{status: session.StatusIdle, tool: "shell", title: inst.Title, account: slot, accountDisplay: newAccountPresentation(slot, true), autoName: auto, paneTitle: "pane subtitle", autoNameDesc: "description"}
+					inst := &session.Instance{
+						ID:     "width",
+						Title:  strings.Repeat("Title日本é", 8),
+						Tool:   "claude",
+						Status: session.StatusIdle,
+					}
+					state := sessionRenderState{
+						status:         session.StatusIdle,
+						tool:           "claude",
+						title:          inst.Title,
+						accountDisplay: newAccountPresentation(label),
+						autoName:       auto,
+						paneTitle:      "pane subtitle",
+						autoNameDesc:   "description",
+					}
 					for _, selected := range []bool{false, true} {
 						var b strings.Builder
-						h.renderSessionItem(&b, session.Item{Type: session.ItemTypeSession, Session: inst, Level: 1, Path: "work", IsLastInGroup: true}, selected, map[string]sessionRenderState{inst.ID: state}, width)
+						h.renderSessionItem(&b, session.Item{
+							Type: session.ItemTypeSession, Session: inst, Level: 1, Path: "work", IsLastInGroup: true,
+						}, selected, map[string]sessionRenderState{inst.ID: state}, width)
 						line := strings.TrimSuffix(b.String(), "\n")
 						require.True(t, utf8.ValidString(line))
-						require.LessOrEqual(t, cellWidth(line), width)
-						require.NotContains(t, line, "\x1b]0;bad")
-						require.NotContains(t, line, "\a")
-						require.NotContains(t, line, "\r")
+						require.LessOrEqual(t, cellWidth(line), width, "badge must not push the row past the terminal")
 						require.NotContains(t, line, "\n")
-						if width >= 40 {
-							require.Contains(t, line, "[account:")
+						require.NotContains(t, line, "\r")
+						if label == "" {
+							require.NotContains(t, line, "[work")
 						}
 					}
 				})
@@ -39,14 +59,14 @@ func TestStoredAccountWidthMatrix(t *testing.T) {
 	}
 }
 
-func TestStoredAccountSnapshotIsAuthoritative(t *testing.T) {
-	h := NewHome()
-	inst := &session.Instance{ID: "snapshot", Title: "title", Tool: "shell", Status: session.StatusIdle, Account: "first"}
-	h.refreshSessionRenderSnapshot([]*session.Instance{inst})
-	inst.Account = "second" // Sequential controlled mutation; no concurrent writer.
-	require.Equal(t, "first", h.getSessionRenderState(inst).account)
-	require.Equal(t, `"first"`, h.getSessionRenderState(inst).accountDisplay.label)
-	h.refreshSessionRenderSnapshot([]*session.Instance{inst})
-	require.Equal(t, "second", h.getSessionRenderState(inst).account)
-	require.Equal(t, `"second"`, h.getSessionRenderState(inst).accountDisplay.label)
+// A label too long for the row is truncated with its delimiters intact, so a
+// shortened dir still reads as a badge rather than as stray text.
+func TestConfigDirLabelTruncationKeepsDelimiters(t *testing.T) {
+	p := newAccountPresentation("work-with-a-very-long-name")
+	badge, width := p.fit(12)
+	require.True(t, strings.HasPrefix(badge, " ["), "badge = %q", badge)
+	require.True(t, strings.HasSuffix(badge, "]"), "badge = %q", badge)
+	require.Contains(t, badge, "…", "a truncated label must show it was cut")
+	require.LessOrEqual(t, width, 12)
+	require.Equal(t, width, cellWidth(badge))
 }
