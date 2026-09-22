@@ -354,6 +354,9 @@ func main() {
 		case "list", "ls":
 			handleList(profile, args[1:])
 			return
+		case "overlay-snapshot":
+			handleOverlaySnapshot(profile, args[1:])
+			return
 		case "remove", "rm":
 			handleRemove(profile, args[1:])
 			return

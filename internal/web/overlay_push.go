@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -38,6 +39,11 @@ type overlaySession struct {
 	// GitHub PRs mentioned in this session's transcript, first-seen order.
 	// Rendered as clickable #NNNN chips so a session links back to its PRs.
 	PRs []prRef `json:"prs,omitempty"`
+	// Host is the machine this session lives on: the controller's own short
+	// hostname for local rows, or the configured remote name for rows pulled
+	// from another deck. Empty from a deck too old to send it, which the
+	// overlay renders as local.
+	Host string `json:"host,omitempty"`
 }
 
 type overlayPayload struct {
@@ -125,6 +131,29 @@ type overlayPusher struct {
 	// Incremental PR-scan position per session. Guarded by mu, like the maps
 	// above: push() holds it across the whole scan loop.
 	prCache map[string]*prScanState
+	// Other machines' rows, refreshed on their own slower schedule. Has its own
+	// lock: a remote fetch completing must not wait on the push loop.
+	remotes remoteOverlayCache
+	// How long a session may have been idle and still be shown. Zero keeps the
+	// per-tool default (its cache TTL plus an hour). A controller pulling
+	// another machine asks for a wider window: those sessions are the ones you
+	// cannot see any other way, so the local "it expired, you were here" logic
+	// does not apply to them.
+	maxIdle time.Duration
+	// Why rows were dropped on the last build. A machine wired up for the first
+	// time that contributes nothing is otherwise silent, and the reason is never
+	// the same one twice.
+	stats overlayBuildStats
+}
+
+// overlayBuildStats counts what each filter removed, for overlay-snapshot's
+// explain output.
+type overlayBuildStats struct {
+	Items          int
+	NoTool         int
+	StatusFiltered int
+	IdleFiltered   int
+	Emitted        int
 }
 
 func newOverlayPusher(menuData MenuDataLoader) *overlayPusher {
@@ -139,11 +168,16 @@ func newOverlayPusher(menuData MenuDataLoader) *overlayPusher {
 	}
 }
 
-func (o *overlayPusher) push(ctx context.Context) {
+// buildLocalSessions turns this machine's session snapshot into overlay rows.
+// Split out of push so the same rows can be emitted by the overlay-snapshot
+// command, which is what a controller runs over SSH to pull a remote deck's
+// rows. One shape, built one way, wherever it is read from.
+func (o *overlayPusher) buildLocalSessions() ([]overlaySession, bool) {
+	o.stats = overlayBuildStats{}
 	snapshot, err := o.menuData.LoadMenuSnapshot()
 	if err != nil {
 		overlayLog.Debug("overlay_snapshot_failed", slog.String("error", err.Error()))
-		return
+		return nil, false
 	}
 
 	priorities := sessionPriorities()
@@ -161,13 +195,16 @@ func (o *overlayPusher) push(ctx context.Context) {
 			continue
 		}
 		s := item.Session
+		o.stats.Items++
 		tool := mapToolName(s.Tool)
 		if tool == "" {
+			o.stats.NoTool++
 			continue
 		}
 
 		status := strings.ToLower(string(s.Status))
 		if status != "running" && status != "waiting" && status != "idle" {
+			o.stats.StatusFiltered++
 			continue
 		}
 
@@ -185,7 +222,20 @@ func (o *overlayPusher) push(ctx context.Context) {
 		// which made idle sessions look recently active (see handlers_mobile.go).
 		var lastTurn time.Time
 		var prs []prRef
-		if path, ok := sessionTranscriptPath(s.ProjectPath, s.ClaudeSessionID); ok {
+		// Recover the conversation id the way attach does: the hook anchor
+		// first, the stored id second. A session agent-deck did not start
+		// itself (a harness launching `claude` directly, which is how the work
+		// fleet runs) never persists an id, so the stored field is empty while
+		// the hooks have been writing the real one on every turn. Without this
+		// the transcript is unreachable, the countdown falls back to "when the
+		// user last attached in the TUI", and a whole machine of actively
+		// working sessions reads as idle for days and never reaches the
+		// overlay at all.
+		claudeID := session.ReadHookSessionAnchor(s.ID)
+		if claudeID == "" {
+			claudeID = s.ClaudeSessionID
+		}
+		if path, ok := sessionTranscriptPath(s.ProjectPath, claudeID); ok {
 			if ts, ok2 := lastTurnTimestamp(path); ok2 {
 				lastTurn = ts
 			}
@@ -236,7 +286,12 @@ func (o *overlayPusher) push(ctx context.Context) {
 		o.lastStatus[s.ID] = isActive
 
 		ttl := cacheTTL(tool)
-		if !isActive && idleSecs > ttl+3600 {
+		cutoff := ttl + 3600
+		if o.maxIdle > 0 {
+			cutoff = int(o.maxIdle.Seconds())
+		}
+		if !isActive && idleSecs > cutoff {
+			o.stats.IdleFiltered++
 			continue
 		}
 
@@ -259,6 +314,22 @@ func (o *overlayPusher) push(ctx context.Context) {
 		})
 	}
 	o.mu.Unlock()
+
+	return sessions, true
+}
+
+func (o *overlayPusher) push(ctx context.Context) {
+	sessions, ok := o.buildLocalSessions()
+	if !ok {
+		return
+	}
+	// Tag our own rows before merging in other machines', so every row on the
+	// overlay says where it came from.
+	localHost := localHostLabel()
+	for i := range sessions {
+		sessions[i].Host = localHost
+	}
+	sessions = append(sessions, o.remoteOverlaySessions(ctx)...)
 
 	payload := overlayPayload{Source: "agent-deck", Sessions: sessions, Usage: readUsage()}
 	body, err := json.Marshal(payload)

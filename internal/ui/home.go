@@ -8791,6 +8791,24 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Remote rows: a session on another machine, pulled in over SSH. The
+		// overlay sends the same "select <id>" for these, so resolve them here
+		// and attach over SSH in this same tab, exactly as pressing Enter on the
+		// row does. Without this branch a click on another machine's session
+		// silently did nothing: the loops above only match local instances.
+		for i, item := range h.flatItems {
+			if item.Type != session.ItemTypeRemoteSession || item.RemoteSession == nil {
+				continue
+			}
+			if item.RemoteSession.ID == msg.Target ||
+				strings.EqualFold(item.RemoteSession.Title, msg.Target) ||
+				strings.ToLower(item.RemoteSession.Title) == target {
+				h.cursor = i
+				h.syncViewport()
+				return h, h.attachRemoteSession(item.RemoteName, item.RemoteSession.ID)
+			}
+		}
+
 		uiLog.Warn("ipc_select_target_not_found", slog.String("target", msg.Target))
 		return h, nil
 
