@@ -47,6 +47,7 @@ type remoteOverlayEntry struct {
 	fetchedAt time.Time // last SUCCESSFUL fetch
 	inFlight  bool
 	lastTry   time.Time
+	lastErr   string // last reported failure, so it is logged on change only
 }
 
 type remoteOverlayCache struct {
@@ -106,7 +107,20 @@ func (o *overlayPusher) fetchRemoteOverlay(ctx context.Context, name string, rc 
 	if err != nil {
 		overlayLog.Debug("overlay_remote_fetch_failed",
 			slog.String("remote", name), slog.String("error", err.Error()))
+		// Also say so where a person will actually see it. The structured log
+		// is off on most installs, and a remote that silently contributes
+		// nothing is indistinguishable from one with no sessions. Printed only
+		// when the failure CHANGES, so a host that is simply down does not
+		// write a line every 15 seconds forever.
+		if msg := err.Error(); msg != e.lastErr {
+			e.lastErr = msg
+			fmt.Fprintf(os.Stderr, "overlay: remote %s unreachable: %s\n", name, msg)
+		}
 		return
+	}
+	if e.lastErr != "" {
+		fmt.Fprintf(os.Stderr, "overlay: remote %s recovered\n", name)
+		e.lastErr = ""
 	}
 	e.sessions = sessions
 	e.fetchedAt = time.Now()
@@ -127,10 +141,17 @@ func fetchRemoteOverlaySessions(ctx context.Context, name string, rc session.Rem
 // row with the name this controller knows that machine as.
 func parseRemoteOverlaySessions(out []byte, name string) ([]overlaySession, error) {
 	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" || trimmed[0] != '[' {
-		// A remote too old for the command prints usage or an error, and a
-		// login shell can prepend banners. Not worth an error: the machine
-		// simply contributes no rows until it is updated.
+	if trimmed == "" {
+		// Reported rather than swallowed. An empty reply used to read as "that
+		// machine has no sessions", which is indistinguishable from a transport
+		// that answered successfully with nothing: exactly the failure that hid
+		// a whole machine's fleet behind a silent success.
+		return nil, fmt.Errorf("empty snapshot from %s", name)
+	}
+	if trimmed[0] != '[' {
+		// A remote too old for the command prints usage, and a login shell can
+		// prepend banners. Not worth an error: the machine simply contributes
+		// no rows until it is updated.
 		return nil, nil
 	}
 	var sessions []overlaySession

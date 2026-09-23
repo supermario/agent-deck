@@ -40,8 +40,6 @@ func TestParseRemoteOverlaySessions_RelabelsHost(t *testing.T) {
 // 15s; the machine just contributes nothing until it is updated.
 func TestParseRemoteOverlaySessions_NonArrayOutputIsEmpty(t *testing.T) {
 	for _, out := range []string{
-		"",
-		"   \n",
 		"Usage: agent-deck <command>",
 		"agent-deck: heads-up - your tmux has an unfixed control-mode NULL deref",
 	} {
@@ -51,6 +49,20 @@ func TestParseRemoteOverlaySessions_NonArrayOutputIsEmpty(t *testing.T) {
 		}
 		if sessions != nil {
 			t.Errorf("output %q: want no rows, got %d", out, len(sessions))
+		}
+	}
+}
+
+// Nothing at all is different from "no sessions", and must be reported.
+//
+// The transport can answer successfully with an empty body: the remote agent's
+// in-flight request sharing did exactly that for this verb. Treating that as an
+// empty fleet hid a whole machine behind a silent success, with no error
+// anywhere to explain the missing rows.
+func TestParseRemoteOverlaySessions_EmptyOutputIsAnError(t *testing.T) {
+	for _, out := range []string{"", "   \n"} {
+		if _, err := parseRemoteOverlaySessions([]byte(out), "wbtmbp"); err == nil {
+			t.Errorf("output %q: expected an error, got none", out)
 		}
 	}
 }

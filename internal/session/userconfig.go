@@ -93,6 +93,18 @@ type UserConfig struct {
 	// Default: true (nil = true); unreadable config disables automatic naming.
 	PushTitle *bool `toml:"push_title,omitempty"`
 
+	// OverlayPusher names which process feeds the desktop overlay.
+	//
+	//	"tui"     (default) the interactive deck owns it, as upstream does.
+	//	"service" the headless `agent-deck web --no-tui` service owns it.
+	//
+	// "service" suits a machine where the overlay should keep updating across
+	// TUI restarts, and where one long-lived background process should own the
+	// cross-machine fan-in. Exactly one pusher may be active: both write the
+	// shared "agent-deck" source and would otherwise overwrite each other's
+	// view of the fleet every cycle.
+	OverlayPusher string `toml:"overlay_pusher,omitempty"`
+
 	// GroupSort controls the order of sessions within a group.
 	//   "creation"   (default) — fixed creation order; honors K/J manual reorder.
 	//   "actionable"           — issue #857 status→recency→Order surfacing.
@@ -1536,6 +1548,21 @@ func (c *UserConfig) GetSyncTitle() bool {
 // GetPushTitle returns whether agent-deck may tell the agent its own session
 // name. Defaults to true (nil = true); set push_title = false to leave the
 // agent's name alone and keep the sync one-directional.
+// Overlay pusher owners; see UserConfig.OverlayPusher.
+const (
+	OverlayPusherTUI     = "tui"
+	OverlayPusherService = "service"
+)
+
+// GetOverlayPusher returns the configured overlay owner, defaulting to the
+// interactive TUI so an install that never sets it behaves as it always has.
+func (c *UserConfig) GetOverlayPusher() string {
+	if strings.EqualFold(strings.TrimSpace(c.OverlayPusher), OverlayPusherService) {
+		return OverlayPusherService
+	}
+	return OverlayPusherTUI
+}
+
 func (c *UserConfig) GetPushTitle() bool {
 	if c.PushTitle == nil {
 		return true

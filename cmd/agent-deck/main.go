@@ -540,7 +540,13 @@ func main() {
 	// mode, otherwise two pushers run with independent idle-tracking state
 	// and fight over the session list — expired sessions flicker in and out
 	// every push cycle.
-	if !webEnabled {
+	// ...unless the headless service owns the overlay (overlay_pusher =
+	// "service"), in which case this TUI must stay out of it entirely.
+	overlayOwnedByService := false
+	if cfg, cfgErr := session.LoadUserConfig(); cfgErr == nil && cfg != nil {
+		overlayOwnedByService = cfg.GetOverlayPusher() == session.OverlayPusherService
+	}
+	if !webEnabled && !overlayOwnedByService {
 		overlayCtx, overlayCancel := context.WithCancel(context.Background())
 		defer overlayCancel()
 		web.StartOverlayPusher(overlayCtx, profile)
@@ -978,9 +984,18 @@ func main() {
 			// fallback when MemoryMenuData has no snapshot, so the web UI
 			// reads live data from storage on each request.
 			fmt.Println("Headless mode: TUI disabled")
-			// The interactive TUI owns the desktop overlay; a headless server
-			// that also pushed would fight it on the shared "agent-deck" source.
-			server.DisableOverlayPusher()
+			// The interactive TUI owns the desktop overlay by default; a
+			// headless server that also pushed would fight it on the shared
+			// "agent-deck" source. With overlay_pusher = "service" ownership
+			// reverses: this process pushes and the TUI stands down, so the
+			// overlay survives TUI restarts and one background process owns the
+			// cross-machine fan-in.
+			if cfg, cfgErr := session.LoadUserConfig(); cfgErr != nil || cfg == nil ||
+				cfg.GetOverlayPusher() != session.OverlayPusherService {
+				server.DisableOverlayPusher()
+			} else {
+				fmt.Println("Overlay: this service owns the desktop overlay (overlay_pusher = service)")
+			}
 			fmt.Printf("Web server: http://%s\n", server.Addr())
 			defer func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1225,7 +1240,8 @@ var commandRegistry = map[string]bool{
 	"hermes-hooks": true, "cursor-hooks": true, "deepseek": true, "notify-daemon": true,
 	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true, "telemetry": true,
 	"debug-dump": true, "version": true, "--version": true, "-v": true,
-	"help": true, "--help": true, "-h": true,
+	"overlay-snapshot": true,
+	"help":             true, "--help": true, "-h": true,
 }
 
 // extractProfileFlag extracts the global -p or --profile flag from args,

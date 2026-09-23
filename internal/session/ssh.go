@@ -271,10 +271,35 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 			// Written, reply lost. Re-running a listing is harmless; a
 			// mutating verb may already have run on the remote (#3), so
 			// its error goes to the caller, who refetches.
+		case remoteVerbReadOnly(args):
+			// Any other channel failure on a read-only verb: fall through to a
+			// plain exec instead of failing the caller. The channel is meant to
+			// be an optimisation, never a new way to fail, and re-running a
+			// listing is harmless. Observed with a verb the channel accepted but
+			// never answered: every request burned its whole timeout while the
+			// same command over a plain exec returned in under half a second.
 		default:
 			return out, err
 		}
 	}
+	// A channel that accepts a request and never answers it consumes the
+	// caller's whole budget before failing, which would leave this exec with an
+	// already-expired context and turn the fallback into a second failure. Give
+	// it a fresh budget. A deliberate cancel is different: the caller wants out,
+	// so honour it.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		timeout := r.commandTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer cancel()
+	}
+
 	if err := ValidateSSHHost(r.Host); err != nil {
 		return nil, err
 	}
@@ -1517,7 +1542,7 @@ func remoteVerbReadOnly(args []string) bool {
 		second = args[1]
 	}
 	switch args[0] {
-	case "list", "ls", "accounts", "version", "status":
+	case "list", "ls", "accounts", "version", "status", "overlay-snapshot":
 		return true
 	case "group":
 		return second == "list"
